@@ -1,0 +1,383 @@
+#include <LCDWIKI_GUI.h>
+#include <LCDWIKI_KBV.h>
+#include <DHT.h>
+#include <SD.h>
+#include <SPI.h>
+#include <RTClib.h>
+
+LCDWIKI_KBV mylcd(ILI9481, 40, 38, 39, -1, 41);
+
+#define BLACK   0x0000
+#define WHITE   0xFFFF
+#define YELLOW  0xFFE0
+#define CYAN    0x07FF
+
+#define DHTPIN A0
+#define DHTTYPE DHT11
+DHT dht(DHTPIN, DHTTYPE);
+
+const int chipSelect = 53;
+const int MAX_RECORDS = 480;
+
+int GRAPH_X = 60;
+int GRAPH_Y = 80;
+int GRAPH_W = 0;
+int GRAPH_H = 160;
+int GRAPH_BOTTOM = 0;
+
+#define TEMP_MIN 22
+#define TEMP_MAX 33
+#define HUM_MIN 50
+#define HUM_MAX 100
+
+DateTime start_time;
+unsigned long start_millis;
+unsigned long last_record = 0;
+const long RECORD_INTERVAL = 60000;
+
+void setup() {
+  Serial.begin(9600);
+  mylcd.Init_LCD();
+  mylcd.Fill_Screen(BLACK);
+  mylcd.Set_Rotation(1);
+
+  int screen_w = mylcd.Get_Display_Width();
+  GRAPH_W = screen_w - GRAPH_X - 20;
+  GRAPH_BOTTOM = GRAPH_Y + GRAPH_H;
+
+  dht.begin();
+  pinMode(chipSelect, OUTPUT);
+
+  if (!SD.begin(chipSelect)) {
+    mylcd.Set_Text_colour(WHITE);
+    mylcd.Set_Text_Size(2);
+    mylcd.Print_String("SD Failed!", 10, 10);
+    while (1);
+  }
+
+  const char* compile_date = __DATE__;
+  const char* compile_time = __TIME__;
+  char s_month[6];
+  int month = 1, day = 1, year = 2025, hour = 0, minute = 0, second = 0;
+  static const char month_names[] = "JanFebMarAprMayJunJulAugSepOctNovDec";
+  if (sscanf(compile_date, "%5s %d %d", s_month, &day, &year) == 3) {
+    char* p = strstr((char*)month_names, s_month);
+    if (p) month = (p - month_names) / 3 + 1;
+  }
+  sscanf(compile_time, "%d:%d:%d", &hour, &minute, &second);
+  start_time = DateTime(year, month, day, hour, minute, second);
+  start_millis = millis();
+
+  drawUI();
+  writeCSVHeader();
+  drawGraphFromSD(getCurrentTime());
+}
+
+DateTime getCurrentTime() {
+  unsigned long elapsed = millis() - start_millis;
+  return start_time + TimeSpan(elapsed / 1000);
+}
+
+void loop() {
+  unsigned long now_millis = millis();
+  DateTime now = getCurrentTime();
+
+  if (now_millis - last_record >= RECORD_INTERVAL) {
+    last_record = now_millis;
+    float t = dht.readTemperature();
+    float h = dht.readHumidity();
+    if (!isnan(t) && !isnan(h)) {
+      logToSD(t, h, now);
+      drawGraphFromSD(now);
+    }
+  }
+
+  static unsigned long last_display = 0;
+  if (millis() - last_display > 1000) {
+    last_display = millis();
+    updateTopLine(now);
+  }
+
+  if (Serial.available()) {
+    String cmd = Serial.readStringUntil('\n');
+    cmd.trim();
+    if (cmd == "CLEAR") {
+      clearCSV();
+      Serial.println("📁 temp.csv 已清空");
+    }
+  }
+}
+
+void clearCSV() {
+  SD.remove("temp.csv");
+  File file = SD.open("temp.csv", FILE_WRITE);
+  if (file) {
+    file.println("Time,Temperature,Humidity");
+    file.close();
+  }
+}
+
+void drawUI() {
+  mylcd.Fill_Screen(BLACK);
+  mylcd.Set_Text_Size(2);
+  mylcd.Set_Text_colour(WHITE);
+  mylcd.Print_String("12-Hour Temp/Hum Monitor", 10, 10);
+  drawAxes();
+  drawYAxisLabels();
+}
+
+void drawAxes() {
+  mylcd.Set_Draw_color(WHITE);
+  mylcd.Draw_Rectangle(GRAPH_X - 1, GRAPH_Y - 1, GRAPH_X + GRAPH_W + 1, GRAPH_BOTTOM + 1);
+
+  mylcd.Set_Text_Size(2);
+  for (int t = TEMP_MIN; t <= TEMP_MAX; t += 2) {
+    int y = tempToY(t);
+    mylcd.Set_Text_colour(YELLOW);
+    mylcd.Draw_Fast_HLine(GRAPH_X - 5, y, 5);
+  }
+  for (int h = HUM_MIN; h <= HUM_MAX; h += 10) {
+    int y = humToY(h);
+    mylcd.Set_Text_colour(CYAN);
+    mylcd.Draw_Fast_HLine(GRAPH_X - 5, y, 5);
+  }
+}
+
+void updateTopLine(DateTime now) {
+  float t = dht.readTemperature();
+  float h = dht.readHumidity();
+
+  char time_str[6];
+  sprintf(time_str, "%02d:%02d", now.hour(), now.minute());
+  char temp_str[12];
+  sprintf(temp_str, "%dC", (int)t);
+  char hum_str[8];
+  sprintf(hum_str, "%d%%", (int)h);
+
+  static char last_time[6] = "";
+  static char last_temp[12] = "";
+  static char last_hum[8] = "";
+
+  bool changed = strcmp(time_str, last_time) != 0 ||
+                 strcmp(temp_str, last_temp) != 0 ||
+                 strcmp(hum_str, last_hum) != 0;
+
+  if (!changed) return;
+
+  int screen_w = mylcd.Get_Display_Width();
+  int section_w = screen_w / 3;
+  int center1 = section_w / 2;
+  int center2 = section_w + section_w / 2;
+  int center3 = section_w * 2 + section_w / 2;
+
+  mylcd.Set_Draw_color(BLACK);
+  mylcd.Fill_Rectangle(0, 30, screen_w, 60);
+  mylcd.Set_Text_Size(4);
+  mylcd.Set_Text_colour(WHITE);
+
+  auto print_centered = [&](const char* s, int cx, int y) {
+    int char_w = 12;
+    int w = strlen(s) * char_w;
+    int x = cx - w / 2;
+    mylcd.Print_String(s, x, y);
+  };
+
+  print_centered(time_str, center1, 32);
+  print_centered(temp_str, center2, 32);
+  print_centered(hum_str, center3, 32);
+
+  strcpy(last_time, time_str);
+  strcpy(last_temp, temp_str);
+  strcpy(last_hum, hum_str);
+}
+
+void writeCSVHeader() {
+  File file = SD.open("temp.csv", FILE_WRITE);
+  if (file && file.size() == 0) {
+    file.println("Timestamp,Temperature_C,Humidity_%");
+  }
+  file.close();
+}
+
+void logToSD(float temp, float hum, DateTime now) {
+  File file = SD.open("temp.csv", FILE_READ);
+  if (!file) return;
+
+  int line_count = 0;
+  while (file.available()) {
+    String line = file.readStringUntil('\n');
+    if (line.length() > 0) line_count++;
+  }
+  file.close();
+
+  if (line_count > MAX_RECORDS + 1) {
+    File oldFile = SD.open("temp.csv", FILE_READ);
+    String header = oldFile.readStringUntil('\n');
+    String newContent = header + "\n";
+    int skipped = 0;
+    while (oldFile.available()) {
+      String line = oldFile.readStringUntil('\n');
+      if (skipped == 0) { skipped++; continue; }
+      newContent += line + "\n";
+    }
+    oldFile.close();
+
+    SD.remove("temp.csv");
+    File newFile = SD.open("temp.csv", FILE_WRITE);
+    newFile.print(newContent);
+    newFile.close();
+  }
+
+  File fileWrite = SD.open("temp.csv", FILE_WRITE);
+  if (fileWrite) {
+    char timestamp[20];
+    sprintf(timestamp, "%04d-%02d-%02d %02d:%02d:00",
+            now.year(), now.month(), now.day(), now.hour(), now.minute());
+    fileWrite.print(timestamp);
+    fileWrite.print(",");
+    fileWrite.print(temp, 1);
+    fileWrite.print(",");
+    fileWrite.println(hum, 0);
+    fileWrite.close();
+  }
+}
+
+int tempToY(float temp) {
+  temp = constrain(temp, TEMP_MIN, TEMP_MAX);
+  int y = GRAPH_BOTTOM - (int)((temp - TEMP_MIN) * GRAPH_H / (TEMP_MAX - TEMP_MIN));
+  return constrain(y, GRAPH_Y, GRAPH_BOTTOM);
+}
+
+int humToY(float hum) {
+  hum = constrain(hum, HUM_MIN, HUM_MAX);
+  int y = GRAPH_BOTTOM - (int)((hum - HUM_MIN) * GRAPH_H / (HUM_MAX - HUM_MIN));
+  return constrain(y, GRAPH_Y, GRAPH_BOTTOM);
+}
+
+void drawYAxisLabels() {
+  mylcd.Set_Text_Size(2);
+
+  for (int t = TEMP_MIN; t <= TEMP_MAX; t += 2) {
+    int y = tempToY(t);
+    mylcd.Set_Text_colour(YELLOW);
+    char buf[8];
+    sprintf(buf, "%dC", t);
+    mylcd.Print_String(buf, 8, y - 6);
+  }
+
+  for (int h = HUM_MIN; h <= HUM_MAX; h += 10) {
+    int y = humToY(h);
+    mylcd.Set_Text_colour(CYAN);
+    char buf[8];
+    sprintf(buf, "%d%%", h);
+    mylcd.Print_String(buf, 32, y - 6);
+  }
+}
+
+void drawGraphFromSD(DateTime now) {
+  File file = SD.open("temp.csv");
+  if (!file) {
+    Serial.println("❌ 無法開啟 temp.csv");
+    return;
+  }
+
+  file.readStringUntil('\n'); // 跳過標頭
+
+  struct Rec {
+    DateTime time;
+    float temp;
+    float hum;
+  };
+  Rec recs[GRAPH_W];
+  int count = 0;
+  char line[96];
+
+  while (file.available()) {
+    size_t len = file.readBytesUntil('\n', line, sizeof(line) - 1);
+    if (len == 0) break;
+    line[len] = '\0';
+
+    char* token = strtok(line, ",");
+    if (!token) continue;
+    char* timestamp = token;
+
+    token = strtok(NULL, ",");
+    if (!token) continue;
+    float t = atof(token);
+
+    token = strtok(NULL, ",");
+    if (!token) continue;
+    float h = atof(token);
+
+    int y, mo, d, hr, mi;
+    if (sscanf(timestamp, "%d-%d-%d %d:%d", &y, &mo, &d, &hr, &mi) != 5) continue;
+    DateTime record_time(y, mo, d, hr, mi, 0);
+    TimeSpan diff = now - record_time;
+    int minutes_ago = diff.totalseconds() / 60;
+
+    if (minutes_ago < 0 || minutes_ago > 720) continue;
+
+    recs[count++] = {record_time, t, h};
+  }
+  file.close();
+
+  if (count == 0) return;
+
+  mylcd.Set_Draw_color(BLACK);
+  mylcd.Fill_Rectangle(GRAPH_X, GRAPH_Y, GRAPH_X + GRAPH_W, GRAPH_BOTTOM);
+
+  DateTime oldest = recs[0].time;
+  DateTime newest = recs[count - 1].time;
+  long total_minutes = (newest - oldest).totalseconds() / 60;
+  if (total_minutes == 0) total_minutes = 1;
+
+  for (int i = 1; i < count; i++) {
+    long min1 = (recs[i - 1].time - oldest).totalseconds() / 60;
+    long min2 = (recs[i].time - oldest).totalseconds() / 60;
+
+    int x1 = GRAPH_X + (min1 * GRAPH_W / total_minutes);
+    int x2 = GRAPH_X + (min2 * GRAPH_W / total_minutes);
+
+    mylcd.Set_Draw_color(YELLOW);
+    mylcd.Draw_Line(x1, tempToY(recs[i - 1].temp), x2, tempToY(recs[i].temp));
+
+    mylcd.Set_Draw_color(CYAN);
+    mylcd.Draw_Line(x1, humToY(recs[i - 1].hum), x2, humToY(recs[i].hum));
+  }
+
+  long latest_min = (recs[count - 1].time - oldest).totalseconds() / 60;
+  int latest_x = GRAPH_X + (latest_min * GRAPH_W / total_minutes);
+  int temp_y = tempToY(recs[count - 1].temp);
+  int hum_y = humToY(recs[count - 1].hum);
+
+  mylcd.Set_Draw_color(YELLOW);
+  mylcd.Fill_Circle(latest_x, temp_y, 2);
+  mylcd.Set_Draw_color(CYAN);
+  mylcd.Fill_Circle(latest_x, hum_y, 2);
+
+
+  // 清除 X 軸刻度區域
+  mylcd.Set_Draw_color(BLACK);
+  mylcd.Fill_Rectangle(GRAPH_X, GRAPH_BOTTOM + 6, GRAPH_X + GRAPH_W, GRAPH_BOTTOM + 20);
+
+
+  // 根據資料時間範圍平均分佈 X 軸刻度（最多 6 格）
+  mylcd.Set_Text_colour(WHITE);
+  mylcd.Set_Text_Size(2);
+  
+  int tick_count = 4;
+  
+  for (int i = 0; i <= tick_count; i++) {
+    long tick_offset = (i * total_minutes) / tick_count;
+    DateTime tick_time = oldest + TimeSpan(0, 0, tick_offset, 0);
+    int x = GRAPH_X + (tick_offset * GRAPH_W / total_minutes);
+  
+    mylcd.Draw_Fast_VLine(x, GRAPH_BOTTOM, 5);
+  
+    char buf[6];
+    sprintf(buf, "%02d:%02d", tick_time.hour(), tick_time.minute());
+    mylcd.Print_String(buf, x - 12, GRAPH_BOTTOM + 8);
+  }
+
+
+}
