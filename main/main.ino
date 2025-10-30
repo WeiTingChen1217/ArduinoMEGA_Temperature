@@ -20,13 +20,13 @@ DHT dht(DHTPIN, DHTTYPE);
 const int chipSelect = 53;
 const int MAX_RECORDS = 480;
 
-int GRAPH_X = 60;
+int GRAPH_X = 85;
 int GRAPH_Y = 80;
 int GRAPH_W = 0;
 int GRAPH_H = 160;
 int GRAPH_BOTTOM = 0;
 
-#define TEMP_MIN 25
+#define TEMP_MIN 22
 #define TEMP_MAX 30
 #define HUM_MIN 50
 #define HUM_MAX 100
@@ -71,7 +71,7 @@ void setup() {
 
   drawUI();
   writeCSVHeader();
-  drawGraphFromSD(getCurrentTime());
+  drawGraphFromSD();
 }
 
 DateTime getCurrentTime() {
@@ -89,7 +89,7 @@ void loop() {
     float h = dht.readHumidity();
     if (!isnan(t) && !isnan(h)) {
       logToSD(t, h, now);
-      drawGraphFromSD(now);
+      drawGraphFromSD();
     }
   }
 
@@ -269,7 +269,7 @@ void drawYAxisLabels() {
     mylcd.Set_Text_colour(YELLOW);
     char buf[8];
     sprintf(buf, "%dC", t);
-    mylcd.Print_String(buf, 8, y - 6);
+    mylcd.Print_String(buf, 0, y - 6);
   }
 
   for (int h = HUM_MIN; h <= HUM_MAX; h += 10) {
@@ -277,11 +277,14 @@ void drawYAxisLabels() {
     mylcd.Set_Text_colour(CYAN);
     char buf[8];
     sprintf(buf, "%d%%", h);
-    mylcd.Print_String(buf, 32, y - 6);
+    mylcd.Print_String(buf, 40, y - 6);
   }
 }
 
-void drawGraphFromSD(DateTime now) {
+void drawGraphFromSD() {
+  const int TICK_COUNT = 4;
+  const int MAX_POINTS = GRAPH_W; // 每筆資料對應 1px
+
   File file = SD.open("temp.csv");
   if (!file) {
     Serial.println("❌ 無法開啟 temp.csv");
@@ -290,16 +293,44 @@ void drawGraphFromSD(DateTime now) {
 
   file.readStringUntil('\n'); // 跳過標頭
 
-  struct Rec {
-    DateTime time;
-    float temp;
-    float hum;
-  };
-  Rec recs[GRAPH_W];
-  int count = 0;
-  char line[96];
-
+  // 預掃總筆數
+  int total_lines = 0;
   while (file.available()) {
+    String line = file.readStringUntil('\n');
+    if (line.length() > 0) total_lines++;
+  }
+  file.close();
+
+  if (total_lines == 0) return;
+
+  int skip_lines = max(0, total_lines - MAX_POINTS);
+
+  file = SD.open("temp.csv");
+  file.readStringUntil('\n'); // 跳過標頭
+
+  // 跳過前面資料
+  for (int i = 0; i < skip_lines; i++) {
+    file.readStringUntil('\n');
+  }
+
+  mylcd.Set_Draw_color(BLACK);
+  mylcd.Fill_Rectangle(GRAPH_X, GRAPH_Y, GRAPH_X + GRAPH_W, GRAPH_BOTTOM);
+
+  float last_temp = 0, last_hum = 0;
+  int last_x = -1, last_temp_y = -1, last_hum_y = -1;
+
+  int index = 0;
+  int tick_interval = MAX_POINTS / TICK_COUNT;
+
+  struct Tick {
+    int x;
+    DateTime time;
+  };
+  Tick ticks[TICK_COUNT + 1];
+  int tick_index = 0;
+
+  char line[96];
+  while (file.available() && index < MAX_POINTS) {
     size_t len = file.readBytesUntil('\n', line, sizeof(line) - 1);
     if (len == 0) break;
     line[len] = '\0';
@@ -319,74 +350,55 @@ void drawGraphFromSD(DateTime now) {
     int y, mo, d, hr, mi;
     if (sscanf(timestamp, "%d-%d-%d %d:%d", &y, &mo, &d, &hr, &mi) != 5) continue;
     DateTime record_time(y, mo, d, hr, mi, 0);
-    TimeSpan diff = now - record_time;
-    int minutes_ago = diff.totalseconds() / 60;
 
-    if (minutes_ago < 0 || minutes_ago > 720) continue;
+    int x = GRAPH_X + index;
+    int temp_y = tempToY(t);
+    int hum_y = humToY(h);
 
-    recs[count++] = {record_time, t, h};
+    if (last_x >= 0) {
+      mylcd.Set_Draw_color(YELLOW);
+      mylcd.Draw_Line(last_x, last_temp_y, x, temp_y);
+      mylcd.Set_Draw_color(CYAN);
+      mylcd.Draw_Line(last_x, last_hum_y, x, hum_y);
+    }
+
+    last_x = x;
+    last_temp_y = temp_y;
+    last_hum_y = hum_y;
+
+    if (tick_index <= TICK_COUNT && index % tick_interval == 0) {
+      ticks[tick_index++] = {x, record_time};
+    }
+
+    index++;
   }
+
   file.close();
 
-  if (count == 0) return;
-
-  mylcd.Set_Draw_color(BLACK);
-  mylcd.Fill_Rectangle(GRAPH_X, GRAPH_Y, GRAPH_X + GRAPH_W, GRAPH_BOTTOM);
-
-  DateTime oldest = recs[0].time;
-  DateTime newest = recs[count - 1].time;
-  long total_minutes = (newest - oldest).totalseconds() / 60;
-  if (total_minutes == 0) total_minutes = 1;
-
-  for (int i = 1; i < count; i++) {
-    long min1 = (recs[i - 1].time - oldest).totalseconds() / 60;
-    long min2 = (recs[i].time - oldest).totalseconds() / 60;
-
-    int x1 = GRAPH_X + (min1 * GRAPH_W / total_minutes);
-    int x2 = GRAPH_X + (min2 * GRAPH_W / total_minutes);
-
+  // 畫最新資料點
+  if (last_x >= 0) {
     mylcd.Set_Draw_color(YELLOW);
-    mylcd.Draw_Line(x1, tempToY(recs[i - 1].temp), x2, tempToY(recs[i].temp));
-
+    mylcd.Fill_Circle(last_x, last_temp_y, 2);
     mylcd.Set_Draw_color(CYAN);
-    mylcd.Draw_Line(x1, humToY(recs[i - 1].hum), x2, humToY(recs[i].hum));
+    mylcd.Fill_Circle(last_x, last_hum_y, 2);
   }
-
-  long latest_min = (recs[count - 1].time - oldest).totalseconds() / 60;
-  int latest_x = GRAPH_X + (latest_min * GRAPH_W / total_minutes);
-  int temp_y = tempToY(recs[count - 1].temp);
-  int hum_y = humToY(recs[count - 1].hum);
-
-  mylcd.Set_Draw_color(YELLOW);
-  mylcd.Fill_Circle(latest_x, temp_y, 2);
-  mylcd.Set_Draw_color(CYAN);
-  mylcd.Fill_Circle(latest_x, hum_y, 2);
-
 
   // 清除 X 軸刻度區域
   mylcd.Set_Draw_color(BLACK);
   mylcd.Fill_Rectangle(GRAPH_X, GRAPH_BOTTOM + 6, GRAPH_X + GRAPH_W, GRAPH_BOTTOM + 20);
 
-
-  // 根據資料時間範圍平均分佈 X 軸刻度（最多 6 格）
+  // 繪製 X 軸刻度（以時間顯示）
   mylcd.Set_Text_colour(WHITE);
+  mylcd.Set_Text_Back_colour(BLACK);
   mylcd.Set_Text_Size(2);
-  
-  int tick_count = 4;
-  
-  for (int i = 0; i <= tick_count; i++) {
-    long tick_offset = (i * total_minutes) / tick_count;
-    DateTime tick_time = oldest + TimeSpan(0, 0, tick_offset, 0);
-    int x = GRAPH_X + (tick_offset * GRAPH_W / total_minutes);
-  
-    mylcd.Draw_Fast_VLine(x, GRAPH_BOTTOM, 5);
-  
+  for (int i = 0; i < tick_index; i++) {
+    mylcd.Draw_Fast_VLine(ticks[i].x, GRAPH_BOTTOM, 5);
     char buf[6];
-    sprintf(buf, "%02d:%02d", tick_time.hour(), tick_time.minute());
-    printWithBackground(buf, x - 12, GRAPH_BOTTOM + 8, WHITE, BLACK, 2);
-
+    sprintf(buf, "%02d:%02d", ticks[i].time.hour(), ticks[i].time.minute());
+    printWithBackground(buf, ticks[i].x - 12, GRAPH_BOTTOM + 8, WHITE, BLACK, 2);
   }
 }
+
 
 void printWithBackground(const char* s, int x, int y, uint16_t textColor, uint16_t bgColor, uint8_t text_size) {
   int char_w = 6 * text_size; // 每個字元寬度（根據 Set_Text_Size(2)）
