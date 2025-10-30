@@ -61,9 +61,16 @@ void setup() {
   char s_month[6];
   int month = 1, day = 1, year = 2025, hour = 0, minute = 0, second = 0;
   static const char month_names[] = "JanFebMarAprMayJunJulAugSepOctNovDec";
-  if (sscanf(compile_date, "%5s %d %d", s_month, &day, &year) == 3) {
+  if (sscanf(compile_date, "%5s %d %d", s_month, &day, &year) != 3) {
+    Serial.println("Error: Failed to parse compile_date.");
+    return;
+  }else{
     char* p = strstr((char*)month_names, s_month);
-    if (p) month = (p - month_names) / 3 + 1;
+    if (!p) {
+        Serial.println("Error: Invalid month name.");
+        return;
+    }
+    month = (p - month_names) / 3 + 1;
   }
   sscanf(compile_time, "%d:%d:%d", &hour, &minute, &second);
   start_time = DateTime(year, month, day, hour, minute, second);
@@ -87,9 +94,12 @@ void loop() {
     last_record = now_millis;
     float t = dht.readTemperature();
     float h = dht.readHumidity();
-    if (!isnan(t) && !isnan(h)) {
+    if (!isnan(t) && !isnan(h) && t > -40 && t < 80 && h >= 0 && h <= 100) {
+      // 合理範圍內的數據
       logToSD(t, h, now);
       drawGraphFromSD();
+    } else {
+      Serial.println("Error: Invalid sensor data.");
     }
   }
 
