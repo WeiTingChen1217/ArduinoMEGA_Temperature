@@ -56,24 +56,52 @@ void setup() {
     while (1);
   }
 
+  // 解析編譯時間
   const char* compile_date = __DATE__;
   const char* compile_time = __TIME__;
   char s_month[6];
-  int month = 1, day = 1, year = 2025, hour = 0, minute = 0, second = 0;
+  int c_month = 1, c_day = 1, c_year = 2025, c_hour = 0, c_minute = 0, c_second = 0;
   static const char month_names[] = "JanFebMarAprMayJunJulAugSepOctNovDec";
-  if (sscanf(compile_date, "%5s %d %d", s_month, &day, &year) != 3) {
+  if (sscanf(compile_date, "%5s %d %d", s_month, &c_day, &c_year) != 3) {
     Serial.println("Error: Failed to parse compile_date.");
     return;
-  }else{
+  } else {
     char* p = strstr((char*)month_names, s_month);
     if (!p) {
-        Serial.println("Error: Invalid month name.");
-        return;
+      Serial.println("Error: Invalid month name.");
+      return;
     }
-    month = (p - month_names) / 3 + 1;
+    c_month = (p - month_names) / 3 + 1;
   }
-  sscanf(compile_time, "%d:%d:%d", &hour, &minute, &second);
-  start_time = DateTime(year, month, day, hour, minute, second);
+  sscanf(compile_time, "%d:%d:%d", &c_hour, &c_minute, &c_second);
+  DateTime compile_datetime = DateTime(c_year, c_month, c_day, c_hour, c_minute, c_second);
+
+  // 嘗試從 SD 卡讀取最後時間
+  bool loaded_from_sd = false;
+  DateTime sd_datetime;
+  File time_file = SD.open("last_time.txt");
+  if (time_file) {
+    char buf[20];
+    if (time_file.available()) {
+      time_file.readBytes(buf, 19);
+      buf[19] = '\0';
+      int sd_year, sd_month, sd_day, sd_hour, sd_minute, sd_second;
+      if (sscanf(buf, "%d-%d-%d %d:%d:%d", &sd_year, &sd_month, &sd_day, &sd_hour, &sd_minute, &sd_second) == 6) {
+        sd_datetime = DateTime(sd_year, sd_month, sd_day, sd_hour, sd_minute, sd_second);
+        loaded_from_sd = true;
+      }
+    }
+    time_file.close();
+  }
+
+  // 判斷使用哪個時間
+  if (loaded_from_sd && sd_datetime > compile_datetime) {
+    start_time = sd_datetime;
+    Serial.println("Using SD time (newer)");
+  } else {
+    start_time = compile_datetime;
+    Serial.println("Using compile time (newer or no SD time)");
+  }
   start_millis = millis();
 
   drawUI();
@@ -97,6 +125,7 @@ void loop() {
     if (!isnan(t) && !isnan(h) && t > -40 && t < 80 && h >= 0 && h <= 100) {
       // 合理範圍內的數據
       logToSD(t, h, now);
+      updateLastTimeToSD(now);  // 更新時間到 SD
       drawGraphFromSD();
     } else {
       Serial.println("Error: Invalid sensor data.");
@@ -116,6 +145,17 @@ void loop() {
       clearCSV();
       Serial.println("📁 temp.csv 已清空");
     }
+  }
+}
+
+void updateLastTimeToSD(DateTime time) {
+  SD.remove("last_time.txt");
+  File time_file = SD.open("last_time.txt", FILE_WRITE);
+  if (time_file) {
+    char buf[20];
+    sprintf(buf, "%04d-%02d-%02d %02d:%02d:%02d", time.year(), time.month(), time.day(), time.hour(), time.minute(), time.second());
+    time_file.print(buf);
+    time_file.close();
   }
 }
 
