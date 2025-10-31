@@ -6,6 +6,7 @@
 #include <RTClib.h>
 
 LCDWIKI_KBV mylcd(ILI9481, 40, 38, 39, -1, 41);
+#define FILENAME "temp.csv"
 
 #define BLACK   0x0000
 #define WHITE   0xFFFF
@@ -37,7 +38,7 @@ unsigned long last_record = 0;
 const long RECORD_INTERVAL = 60000;
 
 void setup() {
-  Serial.begin(9600);
+  Serial.begin(115200);
   mylcd.Init_LCD();
   mylcd.Fill_Screen(BLACK);
   mylcd.Set_Rotation(1);
@@ -92,6 +93,8 @@ void setup() {
       }
     }
     time_file.close();
+  }else{
+    Serial.println("no last_time.txt");
   }
 
   // 判斷使用哪個時間
@@ -160,8 +163,8 @@ void updateLastTimeToSD(DateTime time) {
 }
 
 void clearCSV() {
-  SD.remove("temp.csv");
-  File file = SD.open("temp.csv", FILE_WRITE);
+  SD.remove(FILENAME);
+  File file = SD.open(FILENAME, FILE_WRITE);
   if (file) {
     file.println("Time,Temperature,Humidity");
     file.close();
@@ -240,8 +243,8 @@ void updateTopLine(DateTime now) {
   int char_w = 6 * text_size;
   
   printWithBackground(time_str, center1 - strlen(time_str) * char_w / 2, 32, WHITE, BLACK, text_size);
-  printWithBackground(temp_str, center2 - strlen(temp_str) * char_w / 2, 32, WHITE, BLACK, text_size);
-  printWithBackground(hum_str, center3 - strlen(hum_str) * char_w / 2, 32, WHITE, BLACK, text_size);
+  printWithBackground(temp_str, center2 - strlen(temp_str) * char_w / 2, 32, YELLOW, BLACK, text_size);
+  printWithBackground(hum_str, center3 - strlen(hum_str) * char_w / 2, 32, CYAN, BLACK, text_size);
 
   strcpy(last_time, time_str);
   strcpy(last_temp, temp_str);
@@ -249,53 +252,183 @@ void updateTopLine(DateTime now) {
 }
 
 void writeCSVHeader() {
-  File file = SD.open("temp.csv", FILE_WRITE);
+  File file = SD.open(FILENAME, FILE_WRITE);
   if (file && file.size() == 0) {
     file.println("Timestamp,Temperature_C,Humidity_%");
   }
   file.close();
 }
 
-void logToSD(float temp, float hum, DateTime now) {
-  File file = SD.open("temp.csv", FILE_READ);
+struct Record {
+  DateTime time;
+  float temp;
+  float hum;
+};
+
+void logToSD(float t, float h, DateTime time) {
+  File file = SD.open(FILENAME, FILE_WRITE);
   if (!file) return;
 
-  int line_count = 0;
-  while (file.available()) {
-    String line = file.readStringUntil('\n');
-    if (line.length() > 0) line_count++;
+  if (file.size() == 0) {
+    file.println("Timestamp,Temperature_C,Humidity_%");
   }
+
+  char timestamp[20];
+  sprintf(timestamp, "%04d-%02d-%02d %02d:%02d:00",
+          time.year(), time.month(), time.day(),
+          time.hour(), time.minute());
+
+  file.print(timestamp);
+  file.print(",");
+  file.print(t, 1);
+  file.print(",");
+  file.println((int)h);
   file.close();
 
-  if (line_count > MAX_RECORDS + 1) {
-    File oldFile = SD.open("temp.csv", FILE_READ);
-    String header = oldFile.readStringUntil('\n');
-    String newContent = header + "\n";
-    int skipped = 0;
-    while (oldFile.available()) {
-      String line = oldFile.readStringUntil('\n');
-      if (skipped == 0) { skipped++; continue; }
-      newContent += line + "\n";
-    }
-    oldFile.close();
+  if (countLines(FILENAME) > MAX_RECORDS + 1) {
+    trimOldRecords();
+  }
+}
 
-    SD.remove("temp.csv");
-    File newFile = SD.open("temp.csv", FILE_WRITE);
-    newFile.print(newContent);
-    newFile.close();
+int countLines(const char* filename) {
+  File file = SD.open(filename);
+  if (!file) return 0;
+  int lines = 0;
+  while (file.available()) {
+    if (file.read() == '\n') lines++;
+  }
+  int extra = (file.position() > 0 && file.peek() != -1) ? 1 : 0;
+  file.close();
+  return lines + extra;
+}
+
+void trimOldRecords() {
+  File src = SD.open(FILENAME, FILE_READ);
+  if (!src) return;
+
+  const int BUFFER_SIZE = 10;
+  Record buffer[BUFFER_SIZE];
+  int buffer_count = 0;
+
+  src.readStringUntil('\n');               // skip header
+
+  //--- 讀前 BUFFER_SIZE 筆 ---
+  while (src.available() && buffer_count < BUFFER_SIZE) {
+    String line = src.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0) continue;
+
+    char *tok = strtok((char*)line.c_str(), ",");
+    if (!tok) continue;
+    int y,mo,d,hr,mi;
+    if (sscanf(tok, "%d-%d-%d %d:%d:00", &y,&mo,&d,&hr,&mi) != 5) continue;
+
+    tok = strtok(NULL, ",");
+    if (!tok) continue;
+    float temp = atof(tok);
+
+    tok = strtok(NULL, ",");
+    if (!tok) continue;
+    float hum = atof(tok);
+
+    buffer[buffer_count++] = {DateTime(y,mo,d,hr,mi,0), temp, hum};
   }
 
-  File fileWrite = SD.open("temp.csv", FILE_WRITE);
-  if (fileWrite) {
-    char timestamp[20];
-    sprintf(timestamp, "%04d-%02d-%02d %02d:%02d:00",
-            now.year(), now.month(), now.day(), now.hour(), now.minute());
-    fileWrite.print(timestamp);
-    fileWrite.print(",");
-    fileWrite.print(temp, 1);
-    fileWrite.print(",");
-    fileWrite.println(hum, 0);
-    fileWrite.close();
+  //--- 排序緩衝 ---
+  for (int i = 0; i < buffer_count-1; i++) {
+    for (int j = i+1; j < buffer_count; j++) {
+      if (buffer[i].time > buffer[j].time) {
+        Record tmp = buffer[i];
+        buffer[i] = buffer[j];
+        buffer[j] = tmp;
+      }
+    }
+  }
+
+  //--- 開新檔寫入 ---
+  File dst = SD.open("temp.tmp", FILE_WRITE);
+  if (!dst) { src.close(); return; }
+  dst.println("Timestamp,Temperature_C,Humidity_%");
+
+  // 寫入緩衝
+  for (int i = 0; i < buffer_count; i++) {
+    char ts[20];
+    sprintf(ts, "%04d-%02d-%02d %02d:%02d:00",
+            buffer[i].time.year(), buffer[i].time.month(), buffer[i].time.day(),
+            buffer[i].time.hour(), buffer[i].time.minute());
+    dst.print(ts); dst.print(",");
+    dst.print(buffer[i].temp, 1); dst.print(",");
+    dst.println((int)buffer[i].hum);
+  }
+
+  //--- 其餘資料插入排序 ---
+  while (src.available()) {
+    String line = src.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0) continue;
+
+    char *tok = strtok((char*)line.c_str(), ",");
+    if (!tok) continue;
+    int y,mo,d,hr,mi;
+    if (sscanf(tok, "%d-%d-%d %d:%d:00", &y,&mo,&d,&hr,&mi) != 5) continue;
+
+    tok = strtok(NULL, ",");
+    if (!tok) continue;
+    float temp = atof(tok);
+    tok = strtok(NULL, ",");
+    if (!tok) continue;
+    float hum = atof(tok);
+
+    DateTime dt(y,mo,d,hr,mi,0);
+    bool inserted = false;
+    for (int i = 0; i < buffer_count; i++) {
+      if (dt < buffer[i].time) {
+        if (buffer_count < BUFFER_SIZE) buffer_count++;
+        for (int j = buffer_count-1; j > i; j--) buffer[j] = buffer[j-1];
+        buffer[i] = {dt, temp, hum};
+        inserted = true;
+        break;
+      }
+    }
+    if (!inserted && buffer_count < BUFFER_SIZE) {
+      buffer[buffer_count++] = {dt, temp, hum};
+    }
+
+    if (buffer_count == BUFFER_SIZE) {
+      for (int i = 0; i < BUFFER_SIZE; i++) {
+        char ts[20];
+        sprintf(ts, "%04d-%02d-%02d %02d:%02d:00",
+                buffer[i].time.year(), buffer[i].time.month(), buffer[i].time.day(),
+                buffer[i].time.hour(), buffer[i].time.minute());
+        dst.print(ts); dst.print(",");
+        dst.print(buffer[i].temp, 1); dst.print(",");
+        dst.println((int)buffer[i].hum);
+      }
+      buffer_count = 0;
+    }
+  }
+
+  //--- 寫入剩餘緩衝 ---
+  for (int i = 0; i < buffer_count; i++) {
+    char ts[20];
+    sprintf(ts, "%04d-%02d-%02d %02d:%02d:00",
+            buffer[i].time.year(), buffer[i].time.month(), buffer[i].time.day(),
+            buffer[i].time.hour(), buffer[i].time.minute());
+    dst.print(ts); dst.print(",");
+    dst.print(buffer[i].temp, 1); dst.print(",");
+    dst.println((int)buffer[i].hum);
+  }
+
+  src.close(); dst.close();
+
+  //--- 複製回原檔 ---
+  SD.remove(FILENAME);
+  src = SD.open("temp.tmp", FILE_READ);
+  dst = SD.open(FILENAME, FILE_WRITE);
+  if (src && dst) {
+    while (src.available()) dst.write(src.read());
+    dst.close(); src.close();
+    SD.remove("temp.tmp");
   }
 }
 
@@ -332,33 +465,33 @@ void drawYAxisLabels() {
 }
 
 void drawGraphFromSD() {
+  const int MAX_POINTS = GRAPH_W;
   const int TICK_COUNT = 4;
-  const int MAX_POINTS = GRAPH_W; // 每筆資料對應 1px
 
-  File file = SD.open("temp.csv");
+  File file = SD.open(FILENAME);
   if (!file) {
-    Serial.println("❌ 無法開啟 temp.csv");
+    Serial.println("無法開啟 temp.csv");
     return;
   }
 
-  file.readStringUntil('\n'); // 跳過標頭
+  file.readStringUntil('\n'); // 跳過 header
 
-  // 預掃總筆數
+  // 計算總筆數
   int total_lines = 0;
   while (file.available()) {
-    String line = file.readStringUntil('\n');
-    if (line.length() > 0) total_lines++;
+    if (file.readStringUntil('\n').length() > 0) total_lines++;
   }
   file.close();
 
-  if (total_lines == 0) return;
+  if (total_lines == 0) {
+    Serial.println("無資料");
+    return;
+  }
 
   int skip_lines = max(0, total_lines - MAX_POINTS);
+  file = SD.open(FILENAME);
+  file.readStringUntil('\n');
 
-  file = SD.open("temp.csv");
-  file.readStringUntil('\n'); // 跳過標頭
-
-  // 跳過前面資料
   for (int i = 0; i < skip_lines; i++) {
     file.readStringUntil('\n');
   }
@@ -366,17 +499,11 @@ void drawGraphFromSD() {
   mylcd.Set_Draw_color(BLACK);
   mylcd.Fill_Rectangle(GRAPH_X, GRAPH_Y, GRAPH_X + GRAPH_W, GRAPH_BOTTOM);
 
-  float last_temp = 0, last_hum = 0;
   int last_x = -1, last_temp_y = -1, last_hum_y = -1;
-
   int index = 0;
   int tick_interval = MAX_POINTS / TICK_COUNT;
 
-  struct Tick {
-    int x;
-    DateTime time;
-  };
-  Tick ticks[TICK_COUNT + 1];
+  struct Tick { int x; DateTime time; } ticks[TICK_COUNT + 1];
   int tick_index = 0;
 
   char line[96];
@@ -385,36 +512,68 @@ void drawGraphFromSD() {
     if (len == 0) break;
     line[len] = '\0';
 
+    // // === 關鍵 Debug：印出原始資料 ===
+    // Serial.print("RAW [");
+    // Serial.print(index);
+    // Serial.print("]: ");
+    // Serial.println(line);
+
+    // === 解析時間 ===
     char* token = strtok(line, ",");
-    if (!token) continue;
-    char* timestamp = token;
-
-    token = strtok(NULL, ",");
-    if (!token) continue;
-    float t = atof(token);
-
-    token = strtok(NULL, ",");
-    if (!token) continue;
-    float h = atof(token);
+    if (!token) {
+      // Serial.println("  解析失敗：無時間");
+      continue;
+    }
+    // Serial.print("  時間: "); Serial.println(token);
 
     int y, mo, d, hr, mi;
-    if (sscanf(timestamp, "%d-%d-%d %d:%d", &y, &mo, &d, &hr, &mi) != 5) continue;
+    if (sscanf(token, "%d-%d-%d %d:%d:00", &y, &mo, &d, &hr, &mi) != 5) {
+      // Serial.println("  時間格式錯誤");
+      continue;
+    }
     DateTime record_time(y, mo, d, hr, mi, 0);
 
+    // === 解析溫度 ===
+    token = strtok(NULL, ",");
+    if (!token) {
+      // Serial.println("  無溫度欄位");
+      continue;
+    }
+    // Serial.print("  溫度字串: ["); Serial.print(token); Serial.println("]");
+
+    // 清理空白
+    char* clean = token;
+    while (*clean == ' ') clean++;
+    char* end = clean + strlen(clean) - 1;
+    while (end > clean && (*end == ' ' || *end == '\r' || *end == '\n')) *end-- = '\0';
+
+    float t = atof(clean);
+    // Serial.print("  解析溫度: "); Serial.println(t, 3);  // 印 3 位小數
+
+    // === 解析濕度 ===
+    token = strtok(NULL, ",");
+    if (!token) {
+      // Serial.println("  無濕度欄位");
+      continue;
+    }
+    clean = token;
+    while (*clean == ' ') clean++;
+    end = clean + strlen(clean) - 1;
+    while (end > clean && (*end == ' ' || *end == '\r' || *end == '\n')) *end-- = '\0';
+    float h = atof(clean);
+    // Serial.print("  濕度: "); Serial.println(h, 1);
+
+    // === 繪圖 ===
     int x = GRAPH_X + index;
     int temp_y = tempToY(t);
     int hum_y = humToY(h);
 
     if (last_x >= 0) {
-      mylcd.Set_Draw_color(YELLOW);
-      mylcd.Draw_Line(last_x, last_temp_y, x, temp_y);
-      mylcd.Set_Draw_color(CYAN);
-      mylcd.Draw_Line(last_x, last_hum_y, x, hum_y);
+      mylcd.Set_Draw_color(YELLOW); mylcd.Draw_Line(last_x, last_temp_y, x, temp_y);
+      mylcd.Set_Draw_color(CYAN);   mylcd.Draw_Line(last_x, last_hum_y, x, hum_y);
     }
 
-    last_x = x;
-    last_temp_y = temp_y;
-    last_hum_y = hum_y;
+    last_x = x; last_temp_y = temp_y; last_hum_y = hum_y;
 
     if (tick_index <= TICK_COUNT && index % tick_interval == 0) {
       ticks[tick_index++] = {x, record_time};
@@ -422,29 +581,23 @@ void drawGraphFromSD() {
 
     index++;
   }
-
   file.close();
 
-  // 畫最新資料點
+  // 畫點 + 刻度（不變）
   if (last_x >= 0) {
-    mylcd.Set_Draw_color(YELLOW);
-    mylcd.Fill_Circle(last_x, last_temp_y, 2);
-    mylcd.Set_Draw_color(CYAN);
-    mylcd.Fill_Circle(last_x, last_hum_y, 2);
+    mylcd.Set_Draw_color(YELLOW); mylcd.Fill_Circle(last_x, last_temp_y, 2);
+    mylcd.Set_Draw_color(CYAN);   mylcd.Fill_Circle(last_x, last_hum_y, 2);
   }
 
-  // 清除 X 軸刻度區域
   mylcd.Set_Draw_color(BLACK);
   mylcd.Fill_Rectangle(GRAPH_X, GRAPH_BOTTOM + 6, GRAPH_X + GRAPH_W, GRAPH_BOTTOM + 20);
 
-  // 繪製 X 軸刻度（以時間顯示）
+  mylcd.Set_Text_Size(2);
   mylcd.Set_Text_colour(WHITE);
   mylcd.Set_Text_Back_colour(BLACK);
-  mylcd.Set_Text_Size(2);
   for (int i = 0; i < tick_index; i++) {
     mylcd.Draw_Fast_VLine(ticks[i].x, GRAPH_BOTTOM, 5);
-    char buf[6];
-    sprintf(buf, "%02d:%02d", ticks[i].time.hour(), ticks[i].time.minute());
+    char buf[6]; sprintf(buf, "%02d:%02d", ticks[i].time.hour(), ticks[i].time.minute());
     printWithBackground(buf, ticks[i].x - 12, GRAPH_BOTTOM + 8, WHITE, BLACK, 2);
   }
 }
