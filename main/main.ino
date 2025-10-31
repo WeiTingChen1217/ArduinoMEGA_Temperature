@@ -34,11 +34,24 @@ int GRAPH_BOTTOM = 0;
 
 DateTime start_time;
 unsigned long start_millis;
-unsigned long last_record = 0;
-const long RECORD_INTERVAL = 60000;
+
+#define BUTTON_PIN 2
+
+volatile bool button_pressed = false;
+bool screen_on = true;
+
+struct Record {
+  DateTime time;
+  float temp;
+  float hum;
+};
 
 void setup() {
   Serial.begin(115200);
+  
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), buttonISR, FALLING);
+
   mylcd.Init_LCD();
   mylcd.Fill_Screen(BLACK);
   mylcd.Set_Rotation(1);
@@ -117,9 +130,20 @@ DateTime getCurrentTime() {
   return start_time + TimeSpan(elapsed / 1000);
 }
 
+void buttonISR() { button_pressed = true; }
+
 void loop() {
   unsigned long now_millis = millis();
   DateTime now = getCurrentTime();
+  static unsigned long last_record = 0;
+  const long RECORD_INTERVAL = 60000;
+
+  if (button_pressed) {
+    Serial.println("button press");
+    button_pressed = false;
+    delay(200);
+    if (digitalRead(BUTTON_PIN) == LOW) toggleScreen();
+  }
 
   if (now_millis - last_record >= RECORD_INTERVAL) {
     last_record = now_millis;
@@ -149,6 +173,19 @@ void loop() {
       Serial.println("📁 temp.csv 已清空");
     }
   }
+}
+
+void toggleScreen() {
+  if (screen_on) {
+    mylcd.Write_Cmd(0x28);
+    Serial.println("off");
+  } else {
+    mylcd.Write_Cmd(0x29);
+    Serial.println("on");
+    drawUI();
+    drawGraphFromSD();
+  }
+  screen_on = !screen_on;
 }
 
 void updateLastTimeToSD(DateTime time) {
@@ -258,12 +295,6 @@ void writeCSVHeader() {
   }
   file.close();
 }
-
-struct Record {
-  DateTime time;
-  float temp;
-  float hum;
-};
 
 void logToSD(float t, float h, DateTime time) {
   File file = SD.open(FILENAME, FILE_WRITE);
