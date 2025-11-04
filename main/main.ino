@@ -6,7 +6,9 @@
 #include <RTClib.h>
 
 LCDWIKI_KBV mylcd(ILI9481, 40, 38, 39, -1, 41);
-#define FILENAME "temp.csv"
+// 放在全域
+const char FILENAME[] = "temp.csv";
+
 
 #define BLACK   0x0000
 #define WHITE   0xFFFF
@@ -34,6 +36,8 @@ int GRAPH_BOTTOM = 0;
 
 DateTime start_time;
 unsigned long start_millis;
+const char LAST_TIME_FILE[] = "lasttime.txt";  // 存啟動時間
+
 
 #define BUTTON_PIN 2
 
@@ -70,63 +74,130 @@ void setup() {
     while (1);
   }
 
-  // 解析編譯時間
-  const char* compile_date = __DATE__;
-  const char* compile_time = __TIME__;
-  char s_month[6];
-  int c_month = 1, c_day = 1, c_year = 2025, c_hour = 0, c_minute = 0, c_second = 0;
-  static const char month_names[] = "JanFebMarAprMayJunJulAugSepOctNovDec";
-  if (sscanf(compile_date, "%5s %d %d", s_month, &c_day, &c_year) != 3) {
-    Serial.println("Error: Failed to parse compile_date.");
-    return;
-  } else {
-    char* p = strstr((char*)month_names, s_month);
-    if (!p) {
-      Serial.println("Error: Invalid month name.");
-      return;
-    }
-    c_month = (p - month_names) / 3 + 1;
-  }
-  sscanf(compile_time, "%d:%d:%d", &c_hour, &c_minute, &c_second);
-  DateTime compile_datetime = DateTime(c_year, c_month, c_day, c_hour, c_minute, c_second);
-
-  // 嘗試從 SD 卡讀取最後時間
-  bool loaded_from_sd = false;
-  DateTime sd_datetime;
-  File time_file = SD.open("last_time.txt");
-  if (time_file) {
-    char buf[20];
-    if (time_file.available()) {
-      time_file.readBytes(buf, 19);
-      buf[19] = '\0';
-      int sd_year, sd_month, sd_day, sd_hour, sd_minute, sd_second;
-      if (sscanf(buf, "%d-%d-%d %d:%d:%d", &sd_year, &sd_month, &sd_day, &sd_hour, &sd_minute, &sd_second) == 6) {
-        sd_datetime = DateTime(sd_year, sd_month, sd_day, sd_hour, sd_minute, sd_second);
-        loaded_from_sd = true;
-      }
-    }
-    time_file.close();
-  }else{
-    Serial.println("no last_time.txt");
-  }
-
-  // 判斷使用哪個時間
-  if (loaded_from_sd && sd_datetime > compile_datetime) {
-    start_time = sd_datetime;
-    Serial.println("Using SD time (newer)");
-  } else {
-    start_time = compile_datetime;
-    Serial.println("Using compile time (newer or no SD time)");
-  }
-  start_millis = millis();
+  // --------------- 時間初始化 -----------------
+  compareAndSetStartTime();   // 取代原本的 loadLastTime + parseCompileTime
+  // --------------------------------------------
 
   drawUI();
-  writeCSVHeader();
   drawGraphFromSD();
+}
+
+/**
+ * 比較 lasttime.txt 與編譯時間，選擇較晚的那個作為 start_time
+ * 回傳 true  → 成功載入/設定
+ * 回傳 false → 兩者都無法解析（極少發生），仍會用編譯時間
+ */
+bool compareAndSetStartTime() {
+  DateTime compile_time = parseCompileTime();
+  char compile_str[20];
+  sprintf(compile_str, "%04d-%02d-%02d %02d:%02d:%02d",
+          compile_time.year(), compile_time.month(), compile_time.day(),
+          compile_time.hour(), compile_time.minute(), compile_time.second());
+  Serial.print(F("編譯時間: "));
+  Serial.println(compile_str);
+
+  DateTime file_time(1970, 1, 1, 0, 0, 0);
+  bool file_valid = false;
+
+  File f = SD.open(LAST_TIME_FILE);
+  if (f) {
+    char file_str[20];
+    size_t len = f.readBytesUntil('\n', file_str, sizeof(file_str) - 1);
+    file_str[len] = '\0';
+    f.close();
+
+    int y, mo, d, h, mi, s;
+    if (sscanf(file_str, "%04d-%02d-%02d %02d:%02d:%02d", &y, &mo, &d, &h, &mi, &s) == 6) {
+      file_time = DateTime(y, mo, d, h, mi, s);
+      file_valid = true;
+      Serial.print(F("lasttime.txt 內容: "));
+      Serial.println(file_str);
+    }
+  }
+
+  if (!file_valid || compile_time >= file_time) {
+    start_time = compile_time;
+    Serial.println(F("採用編譯時間"));
+  } else {
+    start_time = file_time;
+    Serial.println(F("採用檔案時間"));
+  }
+
+  // === 關鍵：先記錄 millis() ===
+  start_millis = millis();
+
+  // === 再寫入 SD ===
+  updateLastTimeToSD(start_time);
+
+  char final_str[20];
+  sprintf(final_str, "%04d-%02d-%02d %02d:%02d:%02d",
+          start_time.year(), start_time.month(), start_time.day(),
+          start_time.hour(), start_time.minute(), start_time.second());
+  Serial.print(F("最終採用時間: "));
+  Serial.println(final_str);
+
+  return true;
+}
+
+DateTime parseCompileTime() {
+  const char* cd = __DATE__, *ct = __TIME__;
+  char sm[5]; int y, mo, d, h, mi, s;
+  sscanf(cd, "%s %d %d", sm, &d, &y);
+  sscanf(ct, "%d:%d:%d", &h, &mi, &s);
+  static const char month_names[] = "JanFebMarAprMayJunJulAugSepOctNovDec";
+  mo = (strstr(month_names, sm) - month_names) / 3 + 1;
+  return DateTime(y, mo, d, h, mi, s);
+}
+
+bool loadLastTime() {
+  File file = SD.open(LAST_TIME_FILE);
+  if (!file) return false;
+
+  char buf[20];
+  size_t len = file.readBytesUntil('\n', buf, sizeof(buf));
+  file.close();
+  if (len < 19) return false;
+
+  int y, mo, d, h, mi, s;
+  if (sscanf(buf, "%04d-%02d-%02d %02d:%02d:%02d", &y, &mo, &d, &h, &mi, &s) != 6) return false;
+
+  start_time = DateTime(y, mo, d, h, mi, s);
+  Serial.print("載入上次時間: "); Serial.println(buf);
+  return true;
+}
+
+void updateLastTimeToSD(DateTime time) {
+  SD.remove(LAST_TIME_FILE);
+  File time_file = SD.open(LAST_TIME_FILE, FILE_WRITE);
+  if (time_file) {
+    char buf[20];
+    sprintf(buf, "%04d-%02d-%02d %02d:%02d:%02d", time.year(), time.month(), time.day(), time.hour(), time.minute(), time.second());
+    time_file.println(buf);
+    time_file.close();
+    Serial.print("儲存時間: "); Serial.println(buf);
+  }
+}
+
+void saveLastTime() {
+  SD.remove(LAST_TIME_FILE);
+  File file = SD.open(LAST_TIME_FILE, FILE_WRITE);
+  if (!file) return;
+
+  char buf[20];
+  sprintf(buf, "%04d-%02d-%02d %02d:%02d:%02d",
+          start_time.year(), start_time.month(), start_time.day(),
+          start_time.hour(), start_time.minute(), start_time.second());
+  file.println(buf);
+  file.close();
+  Serial.print("儲存啟動時間: "); Serial.println(buf);
 }
 
 DateTime getCurrentTime() {
   unsigned long elapsed = millis() - start_millis;
+  // 處理溢位
+  if (millis() < start_millis) {
+    elapsed = (0xFFFFFFFF - start_millis) + millis();
+  }
   return start_time + TimeSpan(elapsed / 1000);
 }
 
@@ -188,16 +259,6 @@ void toggleScreen() {
   screen_on = !screen_on;
 }
 
-void updateLastTimeToSD(DateTime time) {
-  SD.remove("last_time.txt");
-  File time_file = SD.open("last_time.txt", FILE_WRITE);
-  if (time_file) {
-    char buf[20];
-    sprintf(buf, "%04d-%02d-%02d %02d:%02d:%02d", time.year(), time.month(), time.day(), time.hour(), time.minute(), time.second());
-    time_file.print(buf);
-    time_file.close();
-  }
-}
 
 void clearCSV() {
   SD.remove(FILENAME);
@@ -288,14 +349,6 @@ void updateTopLine(DateTime now) {
   strcpy(last_hum, hum_str);
 }
 
-void writeCSVHeader() {
-  File file = SD.open(FILENAME, FILE_WRITE);
-  if (file && file.size() == 0) {
-    file.println("Timestamp,Temperature_C,Humidity_%");
-  }
-  file.close();
-}
-
 void logToSD(float t, float h, DateTime time) {
   File file = SD.open(FILENAME, FILE_WRITE);
   if (!file) return;
@@ -303,6 +356,8 @@ void logToSD(float t, float h, DateTime time) {
   if (file.size() == 0) {
     file.println("Timestamp,Temperature_C,Humidity_%");
   }
+  
+  file.seek(file.size());  // 移到檔尾
 
   char timestamp[20];
   sprintf(timestamp, "%04d-%02d-%02d %02d:%02d:00",
