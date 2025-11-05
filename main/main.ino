@@ -275,8 +275,10 @@ void checkStack(const char* taskName) {
 }
 
 void TaskRecordSensor(void *pvParameters) {
-  const TickType_t interval = 60000 / portTICK_PERIOD_MS;
+  const TickType_t interval = 2000 / portTICK_PERIOD_MS;  // 每 2 秒執行一次
   TickType_t lastWakeTime = xTaskGetTickCount();
+
+  static unsigned long lastLogMillis = 0;
 
   for (;;) {
     DateTime now = getCurrentTime();
@@ -284,30 +286,37 @@ void TaskRecordSensor(void *pvParameters) {
     float h = dht.readHumidity();
 
     if (!isnan(t) && !isnan(h) && t > -40 && t < 80 && h >= 0 && h <= 100) {
-      if (xSemaphoreTake(sdMutex, 100) == pdTRUE) {
-        logToSD(t, h, now);
-        updateLastTimeToSD(now);
-        drawGraphFromSD();
-        xSemaphoreGive(sdMutex);
-      }
-    }
-    checkStack("RecordSensor");
+      updateTopLine(t, h, now);  // ✅ 每 2 秒更新畫面
 
+      // ✅ 每 60 秒記錄一次資料
+      if (millis() - lastLogMillis >= 60000) {
+        if (xSemaphoreTake(sdMutex, 100) == pdTRUE) {
+          logToSD(t, h, now);
+          updateLastTimeToSD(now);
+          xSemaphoreGive(sdMutex);
+        }
+        lastLogMillis = millis();
+      }
+    } else {
+      Serial.println("[RecordSensor] 感測值異常");
+    }
+
+    checkStack("RecordSensor");
     vTaskDelayUntil(&lastWakeTime, interval);
   }
 }
 
 void TaskUpdateDisplay(void *pvParameters) {
-  const TickType_t interval = 1000 / portTICK_PERIOD_MS;
+  const TickType_t interval = 60000 / portTICK_PERIOD_MS;
   TickType_t lastWakeTime = xTaskGetTickCount();
 
   for (;;) {
-    DateTime now = getCurrentTime();
-    updateTopLine(now);
+    if (xSemaphoreTake(sdMutex, 200) == pdTRUE) {
+      drawGraphFromSD();  // ✅ 圖表更新可能較久，獨立執行
+      xSemaphoreGive(sdMutex);
+    }
 
-    UBaseType_t stackLeft = uxTaskGetStackHighWaterMark(NULL);
     checkStack("UpdateDisplay");
-
     vTaskDelayUntil(&lastWakeTime, interval);
   }
 }
@@ -405,10 +414,7 @@ void drawAxes() {
   }
 }
 
-void updateTopLine(DateTime now) {
-  float t = dht.readTemperature();
-  float h = dht.readHumidity();
-
+void updateTopLine(float t, float h, DateTime now) {
   char time_str[6];
   sprintf(time_str, "%02d:%02d", now.hour(), now.minute());
   char temp_str[12];
