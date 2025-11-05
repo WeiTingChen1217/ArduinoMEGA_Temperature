@@ -4,6 +4,9 @@
 #include <SD.h>
 #include <SPI.h>
 #include <RTClib.h>
+#include <Arduino_FreeRTOS.h>
+#include <semphr.h>
+
 
 LCDWIKI_KBV mylcd(ILI9481, 40, 38, 39, -1, 41);
 // 放在全域
@@ -50,8 +53,14 @@ struct Record {
   float hum;
 };
 
+SemaphoreHandle_t sdMutex;
+
+
 void setup() {
   Serial.begin(115200);
+  // 初始化 SD 卡互斥鎖
+  sdMutex = xSemaphoreCreateMutex();
+
   
   pinMode(BUTTON_PIN, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), buttonISR, FALLING);
@@ -80,7 +89,15 @@ void setup() {
 
   drawUI();
   drawGraphFromSD();
+  // 建立任務（堆疊加大）
+  xTaskCreate(TaskRecordSensor, "RecordSensor", 1024, NULL, 2, NULL);
+  xTaskCreate(TaskUpdateDisplay, "UpdateDisplay", 1536, NULL, 1, NULL);
+  xTaskCreate(TaskSerialCommand, "SerialCmd", 1024, NULL, 1, NULL);
+  xTaskCreate(TaskButtonHandler, "ButtonHandler", 512, NULL, 1, NULL);  // 新增按鈕處理任務
+
+
 }
+
 
 /**
  * 比較 lasttime.txt 與編譯時間，選擇較晚的那個作為 start_time
@@ -204,6 +221,8 @@ DateTime getCurrentTime() {
 void buttonISR() { button_pressed = true; }
 
 void loop() {
+  // 不再使用
+/*
   unsigned long now_millis = millis();
   DateTime now = getCurrentTime();
   static unsigned long last_record = 0;
@@ -243,6 +262,94 @@ void loop() {
       clearCSV();
       Serial.println("📁 temp.csv 已清空");
     }
+  }
+*/
+}
+
+void checkStack(const char* taskName) {
+  UBaseType_t stackLeft = uxTaskGetStackHighWaterMark(NULL);
+  if (stackLeft < 50) {
+    Serial.print("["); Serial.print(taskName); Serial.print("] ⚠️ Stack low: ");
+    Serial.println(stackLeft);
+  }
+}
+
+void TaskRecordSensor(void *pvParameters) {
+  const TickType_t interval = 60000 / portTICK_PERIOD_MS;
+  TickType_t lastWakeTime = xTaskGetTickCount();
+
+  for (;;) {
+    DateTime now = getCurrentTime();
+    float t = dht.readTemperature();
+    float h = dht.readHumidity();
+
+    if (!isnan(t) && !isnan(h) && t > -40 && t < 80 && h >= 0 && h <= 100) {
+      if (xSemaphoreTake(sdMutex, 100) == pdTRUE) {
+        logToSD(t, h, now);
+        updateLastTimeToSD(now);
+        drawGraphFromSD();
+        xSemaphoreGive(sdMutex);
+      }
+    }
+    checkStack("RecordSensor");
+
+    vTaskDelayUntil(&lastWakeTime, interval);
+  }
+}
+
+void TaskUpdateDisplay(void *pvParameters) {
+  const TickType_t interval = 1000 / portTICK_PERIOD_MS;
+  TickType_t lastWakeTime = xTaskGetTickCount();
+
+  for (;;) {
+    DateTime now = getCurrentTime();
+    updateTopLine(now);
+
+    UBaseType_t stackLeft = uxTaskGetStackHighWaterMark(NULL);
+    checkStack("UpdateDisplay");
+
+    vTaskDelayUntil(&lastWakeTime, interval);
+  }
+}
+
+void TaskSerialCommand(void *pvParameters) {
+  static String cmdBuffer = "";
+
+  for (;;) {
+    while (Serial.available()) {
+      char c = Serial.read();
+      if (c == '\n') {
+        cmdBuffer.trim();
+        if (cmdBuffer == "CLEAR") {
+          if (xSemaphoreTake(sdMutex, 100) == pdTRUE) {
+            clearCSV();
+            xSemaphoreGive(sdMutex);
+          }
+          Serial.println("📁 temp.csv 已清空");
+        }
+        cmdBuffer = "";
+      } else {
+        cmdBuffer += c;
+      }
+    }
+    checkStack("SerialCmd");
+
+    vTaskDelay(100 / portTICK_PERIOD_MS);
+  }
+}
+
+void TaskButtonHandler(void *pvParameters) {
+  for (;;) {
+    if (button_pressed) {
+      button_pressed = false;
+      vTaskDelay(200 / portTICK_PERIOD_MS);  // debounce
+      if (digitalRead(BUTTON_PIN) == LOW) {
+        toggleScreen();
+      }
+    }
+    checkStack("ButtonHandler");
+
+    vTaskDelay(50 / portTICK_PERIOD_MS);
   }
 }
 
