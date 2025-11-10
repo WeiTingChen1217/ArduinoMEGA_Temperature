@@ -88,14 +88,12 @@ void setup() {
   // --------------------------------------------
 
   drawUI();
-  drawGraphFromSD();
+//  drawGraphFromSD();
   // 建立任務（堆疊加大）
-  xTaskCreate(TaskRecordSensor, "RecordSensor", 1024, NULL, 2, NULL);
+  xTaskCreate(TaskRecordSensor, "RecordSensor", 2048, NULL, 2, NULL);
   xTaskCreate(TaskUpdateDisplay, "UpdateDisplay", 1536, NULL, 1, NULL);
   xTaskCreate(TaskSerialCommand, "SerialCmd", 1024, NULL, 1, NULL);
-  xTaskCreate(TaskButtonHandler, "ButtonHandler", 512, NULL, 1, NULL);  // 新增按鈕處理任務
-
-
+//  xTaskCreate(TaskButtonHandler, "ButtonHandler", 512, NULL, 1, NULL);  // 新增按鈕處理任務
 }
 
 
@@ -290,7 +288,7 @@ void TaskRecordSensor(void *pvParameters) {
 
       // ✅ 每 60 秒記錄一次資料
       if (millis() - lastLogMillis >= 60000) {
-        if (xSemaphoreTake(sdMutex, 100) == pdTRUE) {
+        if (xSemaphoreTake(sdMutex, portMAX_DELAY) == pdTRUE) {
           logToSD(t, h, now);
           updateLastTimeToSD(now);
           xSemaphoreGive(sdMutex);
@@ -311,7 +309,7 @@ void TaskUpdateDisplay(void *pvParameters) {
   TickType_t lastWakeTime = xTaskGetTickCount();
 
   for (;;) {
-    if (xSemaphoreTake(sdMutex, 200) == pdTRUE) {
+    if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
       drawGraphFromSD();  // ✅ 圖表更新可能較久，獨立執行
       xSemaphoreGive(sdMutex);
     }
@@ -330,11 +328,13 @@ void TaskSerialCommand(void *pvParameters) {
       if (c == '\n') {
         cmdBuffer.trim();
         if (cmdBuffer == "CLEAR") {
-          if (xSemaphoreTake(sdMutex, 100) == pdTRUE) {
+          if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
             clearCSV();
             xSemaphoreGive(sdMutex);
+            Serial.println("📁 temp.csv 已清空");
+          }else{
+            Serial.println("fail to erase");
           }
-          Serial.println("📁 temp.csv 已清空");
         }
         cmdBuffer = "";
       } else {
