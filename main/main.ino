@@ -55,6 +55,10 @@ struct Record {
 
 SemaphoreHandle_t sdMutex;
 
+#define DISPLAY_TASK_SIZE 1024
+#define TRIM_BUFFER_SIZE 2048  // 可改成 2048、8192 等視 SRAM 而定
+char trimBuffer[TRIM_BUFFER_SIZE];  // ✅ 放在全域，減少堆疊壓力
+//#define DEBUG_TRIM_LOG  // 註解掉這行即可關閉 trimOldRecords 的 log
 
 void setup() {
   Serial.begin(115200);
@@ -88,14 +92,105 @@ void setup() {
   // --------------------------------------------
 
   drawUI();
+
+  // === 關鍵：開機自動補滿 480 筆假資料 ===
+  ensureFullData();
 //  drawGraphFromSD();
   // 建立任務（堆疊加大）
-  xTaskCreate(TaskRecordSensor, "RecordSensor", 2048, NULL, 2, NULL);
-  xTaskCreate(TaskUpdateDisplay, "UpdateDisplay", 1536, NULL, 1, NULL);
+  xTaskCreate(TaskRecordSensor, "RecordSensor", 1024, NULL, 2, NULL);
+  xTaskCreate(TaskUpdateDisplay, "UpdateDisplay", DISPLAY_TASK_SIZE, NULL, 1, NULL);
   xTaskCreate(TaskSerialCommand, "SerialCmd", 1024, NULL, 1, NULL);
 //  xTaskCreate(TaskButtonHandler, "ButtonHandler", 512, NULL, 1, NULL);  // 新增按鈕處理任務
 }
 
+int countDataLines() {
+  File file = SD.open(FILENAME);
+  if (!file) return 0;
+
+  // 跳過 header
+  file.readStringUntil('\n');
+
+  int lines = 0;
+  while (file.available()) {
+    if (file.readStringUntil('\n').length() > 0) lines++;
+  }
+  file.close();
+  return lines;
+}
+
+void ensureFullData() {
+  if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
+    Serial.println("[ERROR] 無法取得 SD mutex，跳過補資料");
+    return;
+  }
+
+  int currentLines = countDataLines();  // 計算資料筆數（不含 header）
+
+  if (currentLines >= MAX_RECORDS) {
+    Serial.print("資料已足夠：");
+    Serial.print(currentLines);
+    Serial.println(" 筆，無需補充");
+    xSemaphoreGive(sdMutex);
+    return;
+  }
+
+  Serial.print("資料不足（");
+  Serial.print(currentLines);
+  Serial.print(" 筆），開始補滿至 ");
+  Serial.print(MAX_RECORDS);
+  Serial.println(" 筆...");
+
+  // 準備寫入（追加模式）
+  File file = SD.open(FILENAME, FILE_WRITE);
+  if (!file) {
+    Serial.println("無法開啟 temp.csv");
+    xSemaphoreGive(sdMutex);
+    return;
+  }
+
+  // 確保有 header
+  if (file.size() == 0) {
+    file.println("Timestamp,Temperature_C,Humidity_%");
+  } else {
+    // 跳過 header，定位到最後
+    file.seek(file.size());
+  }
+
+  // 計算要補多少筆
+  int toFill = MAX_RECORDS - currentLines;
+
+  // 從「現在時間」往前推
+  DateTime now = getCurrentTime();
+  DateTime baseTime = now - TimeSpan(0, currentLines + toFill - 1, 0, 0);
+
+  for (int i = 0; i < toFill; i++) {
+    DateTime t = baseTime + TimeSpan(0, i, 0, 0);
+
+    // 假溫度：正弦波 + 噪聲
+    float temp = 24.0 + 3.0 * sin((currentLines + i) * 0.13) + random(-80, 81) / 100.0;
+    temp = constrain(temp, 22.0, 30.0);
+
+    // 假濕度：週期變化
+    int hum = 70 + 20 * sin((currentLines + i) * 0.08);
+    hum = constrain(hum, 50, 100);
+
+    char timestamp[20];
+    sprintf(timestamp, "%04d-%02d-%02d %02d:%02d:00",
+            t.year(), t.month(), t.day(), t.hour(), t.minute());
+
+    file.print(timestamp);
+    file.print(",");
+    file.print(temp, 1);
+    file.print(",");
+    file.println(hum);
+  }
+
+  file.close();
+  xSemaphoreGive(sdMutex);
+
+  Serial.print("補充完成！總筆數：");
+  Serial.println(countDataLines());
+}
 
 /**
  * 比較 lasttime.txt 與編譯時間，選擇較晚的那個作為 start_time
@@ -189,7 +284,7 @@ void updateLastTimeToSD(DateTime time) {
     sprintf(buf, "%04d-%02d-%02d %02d:%02d:%02d", time.year(), time.month(), time.day(), time.hour(), time.minute(), time.second());
     time_file.println(buf);
     time_file.close();
-    Serial.print("儲存時間: "); Serial.println(buf);
+    Serial.print("[updateLastTimeToSD] 儲存時間: "); Serial.println(buf);
   }
 }
 
@@ -288,11 +383,14 @@ void TaskRecordSensor(void *pvParameters) {
 
       // ✅ 每 60 秒記錄一次資料
       if (millis() - lastLogMillis >= 60000) {
-        if (xSemaphoreTake(sdMutex, portMAX_DELAY) == pdTRUE) {
+        if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
           logToSD(t, h, now);
           updateLastTimeToSD(now);
           xSemaphoreGive(sdMutex);
+        } else {
+          Serial.println("[RecordSensor] SD busy, skip log");
         }
+
         lastLogMillis = millis();
       }
     } else {
@@ -307,10 +405,46 @@ void TaskRecordSensor(void *pvParameters) {
 void TaskUpdateDisplay(void *pvParameters) {
   const TickType_t interval = 60000 / portTICK_PERIOD_MS;
   TickType_t lastWakeTime = xTaskGetTickCount();
+  
+  static unsigned long lastTrimMillis = 0;
+  const unsigned long TRIM_INTERVAL = 300000UL; // 5 分鐘（毫秒）
 
   for (;;) {
     if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
       drawGraphFromSD();  // ✅ 圖表更新可能較久，獨立執行
+      
+      // ✅ 條件觸發 trim：資料超過 MAX_RECORDS 且距離上次 trim 足夠久
+      int lines = countLines(FILENAME);
+      #ifdef DEBUG_TRIM_LOG
+      Serial.print("[UpdateDisplay] millis: ");
+      Serial.println(millis());
+      Serial.print("[UpdateDisplay] 啟動時 lastTrimMillis: ");
+      Serial.println(lastTrimMillis);
+      Serial.print("[UpdateDisplay] 資料筆數: ");
+      Serial.println(lines);
+      #endif
+      if (millis() - lastTrimMillis > TRIM_INTERVAL) {
+        if (lines > MAX_RECORDS + 1) {
+//          #ifdef DEBUG_TRIM_LOG
+          Serial.print("[UpdateDisplay] 開始 trimOldRecords...");
+          Serial.println(millis());
+          Serial.print("[trimOldRecords] Stack left: ");
+          Serial.println(uxTaskGetStackHighWaterMark(NULL));
+//          #endif
+
+          trimOldRecords();
+          
+//          #ifdef DEBUG_TRIM_LOG
+          Serial.print("[trimOldRecords] 完成搬移");
+          Serial.println(millis());
+          Serial.print("[trimOldRecords] Stack left: ");
+          Serial.println(uxTaskGetStackHighWaterMark(NULL));
+//          #endif
+          
+          lastTrimMillis = millis();
+        }
+      }
+
       xSemaphoreGive(sdMutex);
     }
 
@@ -483,10 +617,6 @@ void logToSD(float t, float h, DateTime time) {
   file.print(",");
   file.println((int)h);
   file.close();
-
-  if (countLines(FILENAME) > MAX_RECORDS + 1) {
-    trimOldRecords();
-  }
 }
 
 int countLines(const char* filename) {
@@ -502,133 +632,103 @@ int countLines(const char* filename) {
 }
 
 void trimOldRecords() {
+  #ifdef DEBUG_TRIM_LOG
+  Serial.println("[trimOldRecords] 開始執行");
+  #endif
+
   File src = SD.open(FILENAME, FILE_READ);
-  if (!src) return;
-
-  const int BUFFER_SIZE = 10;
-  Record buffer[BUFFER_SIZE];
-  int buffer_count = 0;
-
-  src.readStringUntil('\n');               // skip header
-
-  //--- 讀前 BUFFER_SIZE 筆 ---
-  while (src.available() && buffer_count < BUFFER_SIZE) {
-    String line = src.readStringUntil('\n');
-    line.trim();
-    if (line.length() == 0) continue;
-
-    char *tok = strtok((char*)line.c_str(), ",");
-    if (!tok) continue;
-    int y,mo,d,hr,mi;
-    if (sscanf(tok, "%d-%d-%d %d:%d:00", &y,&mo,&d,&hr,&mi) != 5) continue;
-
-    tok = strtok(NULL, ",");
-    if (!tok) continue;
-    float temp = atof(tok);
-
-    tok = strtok(NULL, ",");
-    if (!tok) continue;
-    float hum = atof(tok);
-
-    buffer[buffer_count++] = {DateTime(y,mo,d,hr,mi,0), temp, hum};
+  if (!src) {
+    #ifdef DEBUG_TRIM_LOG
+    Serial.println("[trimOldRecords] 開啟原始檔失敗");
+    #endif
+    return;
   }
 
-  //--- 排序緩衝 ---
-  for (int i = 0; i < buffer_count-1; i++) {
-    for (int j = i+1; j < buffer_count; j++) {
-      if (buffer[i].time > buffer[j].time) {
-        Record tmp = buffer[i];
-        buffer[i] = buffer[j];
-        buffer[j] = tmp;
-      }
-    }
+  int totalLines = 0;
+  while (src.available()) {
+    if (src.read() == '\n') totalLines++;
+  }
+  src.close();
+
+  #ifdef DEBUG_TRIM_LOG
+  Serial.print("[trimOldRecords] 總行數（含 header）: ");
+  Serial.println(totalLines);
+  #endif
+
+  if (totalLines <= MAX_RECORDS + 1) {
+    #ifdef DEBUG_TRIM_LOG
+    Serial.println("[trimOldRecords] 資料尚未超過 MAX_RECORDS，無需裁剪");
+    #endif
+    return;
   }
 
-  //--- 開新檔寫入 ---
+  int skipLines = totalLines - MAX_RECORDS;
+  #ifdef DEBUG_TRIM_LOG
+  Serial.print("[trimOldRecords] 將跳過前 ");
+  Serial.print(skipLines);
+  Serial.println(" 行");
+  #endif
+
+  src = SD.open(FILENAME, FILE_READ);
+  if (!src) {
+    #ifdef DEBUG_TRIM_LOG
+    Serial.println("[trimOldRecords] 第二次開啟原始檔失敗");
+    #endif
+    return;
+  }
+
   File dst = SD.open("temp.tmp", FILE_WRITE);
-  if (!dst) { src.close(); return; }
+  if (!dst) {
+    #ifdef DEBUG_TRIM_LOG
+    Serial.println("[trimOldRecords] 無法建立 temp.tmp");
+    #endif
+    src.close();
+    return;
+  }
+
+  // 跳過前 skipLines 行
+  int skipped = 0;
+  while (src.available() && skipped < skipLines) {
+    if (src.read() == '\n') skipped++;
+  }
+
+  // 寫入 header
   dst.println("Timestamp,Temperature_C,Humidity_%");
 
-  // 寫入緩衝
-  for (int i = 0; i < buffer_count; i++) {
-    char ts[20];
-    sprintf(ts, "%04d-%02d-%02d %02d:%02d:00",
-            buffer[i].time.year(), buffer[i].time.month(), buffer[i].time.day(),
-            buffer[i].time.hour(), buffer[i].time.minute());
-    dst.print(ts); dst.print(",");
-    dst.print(buffer[i].temp, 1); dst.print(",");
-    dst.println((int)buffer[i].hum);
-  }
-
-  //--- 其餘資料插入排序 ---
   while (src.available()) {
-    String line = src.readStringUntil('\n');
-    line.trim();
-    if (line.length() == 0) continue;
-
-    char *tok = strtok((char*)line.c_str(), ",");
-    if (!tok) continue;
-    int y,mo,d,hr,mi;
-    if (sscanf(tok, "%d-%d-%d %d:%d:00", &y,&mo,&d,&hr,&mi) != 5) continue;
-
-    tok = strtok(NULL, ",");
-    if (!tok) continue;
-    float temp = atof(tok);
-    tok = strtok(NULL, ",");
-    if (!tok) continue;
-    float hum = atof(tok);
-
-    DateTime dt(y,mo,d,hr,mi,0);
-    bool inserted = false;
-    for (int i = 0; i < buffer_count; i++) {
-      if (dt < buffer[i].time) {
-        if (buffer_count < BUFFER_SIZE) buffer_count++;
-        for (int j = buffer_count-1; j > i; j--) buffer[j] = buffer[j-1];
-        buffer[i] = {dt, temp, hum};
-        inserted = true;
-        break;
-      }
-    }
-    if (!inserted && buffer_count < BUFFER_SIZE) {
-      buffer[buffer_count++] = {dt, temp, hum};
-    }
-
-    if (buffer_count == BUFFER_SIZE) {
-      for (int i = 0; i < BUFFER_SIZE; i++) {
-        char ts[20];
-        sprintf(ts, "%04d-%02d-%02d %02d:%02d:00",
-                buffer[i].time.year(), buffer[i].time.month(), buffer[i].time.day(),
-                buffer[i].time.hour(), buffer[i].time.minute());
-        dst.print(ts); dst.print(",");
-        dst.print(buffer[i].temp, 1); dst.print(",");
-        dst.println((int)buffer[i].hum);
-      }
-      buffer_count = 0;
-    }
-  }
-
-  //--- 寫入剩餘緩衝 ---
-  for (int i = 0; i < buffer_count; i++) {
-    char ts[20];
-    sprintf(ts, "%04d-%02d-%02d %02d:%02d:00",
-            buffer[i].time.year(), buffer[i].time.month(), buffer[i].time.day(),
-            buffer[i].time.hour(), buffer[i].time.minute());
-    dst.print(ts); dst.print(",");
-    dst.print(buffer[i].temp, 1); dst.print(",");
-    dst.println((int)buffer[i].hum);
+    size_t n = src.readBytes(trimBuffer, TRIM_BUFFER_SIZE);
+    dst.write((uint8_t*)trimBuffer, n);
   }
 
   src.close(); dst.close();
 
-  //--- 複製回原檔 ---
+  #ifdef DEBUG_TRIM_LOG
+  Serial.println("[trimOldRecords] 資料搬移完成，準備覆蓋原始檔");
+  #endif
+
   SD.remove(FILENAME);
-  src = SD.open("temp.tmp", FILE_READ);
-  dst = SD.open(FILENAME, FILE_WRITE);
-  if (src && dst) {
-    while (src.available()) dst.write(src.read());
-    dst.close(); src.close();
+  File final = SD.open(FILENAME, FILE_WRITE);
+  File temp = SD.open("temp.tmp", FILE_READ);
+  if (final && temp) {
+    while (temp.available()) {
+      size_t n = temp.readBytes(trimBuffer, TRIM_BUFFER_SIZE);
+      final.write((uint8_t*)trimBuffer, n);
+    }
+
+    final.close(); temp.close();
     SD.remove("temp.tmp");
+    #ifdef DEBUG_TRIM_LOG
+    Serial.println("[trimOldRecords] 成功覆蓋原始檔並刪除 temp.tmp");
+    #endif
+  } else {
+    #ifdef DEBUG_TRIM_LOG
+    Serial.println("[trimOldRecords] 覆蓋失敗，請檢查 SD 狀態");
+    #endif
   }
+
+  #ifdef DEBUG_TRIM_LOG
+  Serial.println("[trimOldRecords] 執行結束");
+  #endif
 }
 
 int tempToY(float temp) {
