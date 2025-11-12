@@ -1,0 +1,23 @@
+# 忽略构建文件夹
+build/
+
+# 其他常见的忽略项
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# JSON
+*.json
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 环境变量
+.env
+
+# 日志文件
+*.log
