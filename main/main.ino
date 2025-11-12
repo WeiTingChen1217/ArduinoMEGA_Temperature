@@ -549,11 +549,8 @@ void drawAxes() {
 }
 
 void updateTopLine(float t, float h, DateTime now) {
-  char time_str[6];
-  sprintf(time_str, "%02d:%02d", now.hour(), now.minute());
-
-  char date_str[11];
-  sprintf(date_str, "%04d/%02d/%02d", now.year(), now.month(), now.day());
+  char datetime_str[20];
+  sprintf(datetime_str, "%02d:%02d %02d/%02d", now.hour(), now.minute(), now.month(), now.day());
 
   char temp_str[12];
   sprintf(temp_str, "%dC", (int)t);
@@ -561,44 +558,38 @@ void updateTopLine(float t, float h, DateTime now) {
   char hum_str[8];
   sprintf(hum_str, "%d%%", (int)h);
 
-  static char last_time[6] = "";
-  static char last_date[11] = "";
+  static char last_datetime[20] = "";
   static char last_temp[12] = "";
   static char last_hum[8] = "";
 
-  bool changed = strcmp(time_str, last_time) != 0 ||
-                 strcmp(date_str, last_date) != 0 ||
+  bool changed = strcmp(datetime_str, last_datetime) != 0 ||
                  strcmp(temp_str, last_temp) != 0 ||
                  strcmp(hum_str, last_hum) != 0;
 
   if (!changed) return;
 
   int screen_w = mylcd.Get_Display_Width();
-  int section_w = screen_w / 3;
+  int section_w = screen_w / 5;
 
-  int center_time = section_w / 2;       // 左 3/5 的中間
-  int center_temp = section_w + section_w / 2; // 第 4 等分
-  int center_hum = section_w * 2 + section_w / 2;  // 第 5 等分
+  int center_datetime = section_w * 3 / 2;       // 左 3/5 的中間
+  int center_temp = section_w * 3 + section_w / 2; // 第 4 等分
+  int center_hum = section_w * 4 + section_w / 2;  // 第 5 等分
 
-//  mylcd.Set_Draw_color(BLACK);
-//  mylcd.Fill_Rectangle(0, 30, screen_w, 60);
-//  mylcd.Set_Text_Size(4);
-//  mylcd.Set_Text_colour(WHITE);
+  mylcd.Set_Draw_color(BLACK);
+  mylcd.Fill_Rectangle(0, 30, screen_w, 60);
+  mylcd.Set_Text_Size(4);
 
-  uint8_t text_size = 2;
+  uint8_t text_size = 4;
   int char_w = 6 * text_size;
 
-  // 顯示時間與日期（上下兩行）
-  printWithBackground(time_str, center_time - strlen(time_str) * char_w / 2, 32, WHITE, BLACK, text_size);
-  printWithBackground(date_str, center_time - strlen(date_str) * char_w / 2, 48, WHITE, BLACK, text_size);
+  // 顯示時間 + 日期
+  printWithBackground(datetime_str, center_datetime - strlen(datetime_str) * char_w / 2, 40, WHITE, BLACK, text_size);
 
-  text_size = 4;
   // 顯示溫度與濕度
   printWithBackground(temp_str, center_temp - strlen(temp_str) * char_w / 2, 40, YELLOW, BLACK, text_size);
   printWithBackground(hum_str, center_hum - strlen(hum_str) * char_w / 2, 40, CYAN, BLACK, text_size);
 
-  strcpy(last_time, time_str);
-  strcpy(last_date, date_str);
+  strcpy(last_datetime, datetime_str);
   strcpy(last_temp, temp_str);
   strcpy(last_hum, hum_str);
 }
