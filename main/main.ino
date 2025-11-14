@@ -776,6 +776,23 @@ void drawGraphFromSD() {
 
   file.readStringUntil('\n'); // 跳過 header
 
+  // 預先計算總筆數
+  int total_lines = 0;
+  while (file.available()) {
+    if (file.readStringUntil('\n').length() > 0) total_lines++;
+  }
+  file.close();
+
+  int skip_lines = max(0, total_lines - MAX_POINTS);
+
+  // 重新開啟並跳過 header + skip_lines
+  file = SD.open(FILENAME);
+  file.readStringUntil('\n'); // 跳過 header
+  for (int i = 0; i < skip_lines; i++) {
+    file.readStringUntil('\n');
+  }
+
+
   mylcd.Set_Draw_color(BLACK);
   mylcd.Fill_Rectangle(GRAPH_X, GRAPH_Y, GRAPH_X + GRAPH_W, GRAPH_BOTTOM);
 
