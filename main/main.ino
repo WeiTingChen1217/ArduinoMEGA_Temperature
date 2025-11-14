@@ -765,6 +765,8 @@ void drawYAxisLabels() {
 void drawGraphFromSD() {
   const int MAX_POINTS = GRAPH_W;
   const int TICK_COUNT = 4;
+  const int BYTES_PER_LINE = 40;
+  const int LINES_PER_BATCH = TRIM_BUFFER_SIZE / BYTES_PER_LINE;
 
   File file = SD.open(FILENAME);
   if (!file) {
@@ -774,119 +776,63 @@ void drawGraphFromSD() {
 
   file.readStringUntil('\n'); // 跳過 header
 
-  // 計算總筆數
-  int total_lines = 0;
-  while (file.available()) {
-    if (file.readStringUntil('\n').length() > 0) total_lines++;
-  }
-  file.close();
-
-  if (total_lines == 0) {
-    Serial.println("無資料");
-    return;
-  }
-
-  int skip_lines = max(0, total_lines - MAX_POINTS);
-  file = SD.open(FILENAME);
-  file.readStringUntil('\n');
-
-  for (int i = 0; i < skip_lines; i++) {
-    file.readStringUntil('\n');
-  }
-
   mylcd.Set_Draw_color(BLACK);
   mylcd.Fill_Rectangle(GRAPH_X, GRAPH_Y, GRAPH_X + GRAPH_W, GRAPH_BOTTOM);
 
   int last_x = -1, last_temp_y = -1, last_hum_y = -1;
   int index = 0;
   int tick_interval = MAX_POINTS / TICK_COUNT;
-
   struct Tick { int x; DateTime time; } ticks[TICK_COUNT + 1];
   int tick_index = 0;
 
-  char line[96];
   while (file.available() && index < MAX_POINTS) {
-    size_t len = file.readBytesUntil('\n', line, sizeof(line) - 1);
-    if (len == 0) break;
-    line[len] = '\0';
+    for (int i = 0; i < LINES_PER_BATCH && file.available() && index < MAX_POINTS; i++) {
+      size_t len = file.readBytesUntil('\n', trimBuffer, TRIM_BUFFER_SIZE - 1);
+      if (len == 0) continue;
+      trimBuffer[len] = '\0';
 
-    // // === 關鍵 Debug：印出原始資料 ===
-    // Serial.print("RAW [");
-    // Serial.print(index);
-    // Serial.print("]: ");
-    // Serial.println(line);
+      char* token = strtok(trimBuffer, ",");
+      if (!token) continue;
 
-    // === 解析時間 ===
-    char* token = strtok(line, ",");
-    if (!token) {
-      // Serial.println("  解析失敗：無時間");
-      continue;
+      int y, mo, d, hr, mi;
+      if (sscanf(token, "%d-%d-%d %d:%d", &y, &mo, &d, &hr, &mi) != 5) continue;
+      DateTime record_time(y, mo, d, hr, mi, 0);
+
+      token = strtok(NULL, ",");
+      if (!token) continue;
+      float t = atof(token);
+
+      token = strtok(NULL, ",");
+      if (!token) continue;
+      float h = atof(token);
+
+      int x = GRAPH_X + index;
+      int temp_y = tempToY(t);
+      int hum_y = humToY(h);
+
+      if (last_x >= 0) {
+        mylcd.Set_Draw_color(YELLOW); mylcd.Draw_Line(last_x, last_temp_y, x, temp_y);
+        mylcd.Set_Draw_color(CYAN);   mylcd.Draw_Line(last_x, last_hum_y, x, hum_y);
+      }
+
+      last_x = x; last_temp_y = temp_y; last_hum_y = hum_y;
+
+      if (tick_index <= TICK_COUNT && index % tick_interval == 0) {
+        ticks[tick_index++] = {x, record_time};
+      }
+
+      index++;
     }
-    // Serial.print("  時間: "); Serial.println(token);
-
-    int y, mo, d, hr, mi;
-    if (sscanf(token, "%d-%d-%d %d:%d:00", &y, &mo, &d, &hr, &mi) != 5) {
-      // Serial.println("  時間格式錯誤");
-      continue;
-    }
-    DateTime record_time(y, mo, d, hr, mi, 0);
-
-    // === 解析溫度 ===
-    token = strtok(NULL, ",");
-    if (!token) {
-      // Serial.println("  無溫度欄位");
-      continue;
-    }
-    // Serial.print("  溫度字串: ["); Serial.print(token); Serial.println("]");
-
-    // 清理空白
-    char* clean = token;
-    while (*clean == ' ') clean++;
-    char* end = clean + strlen(clean) - 1;
-    while (end > clean && (*end == ' ' || *end == '\r' || *end == '\n')) *end-- = '\0';
-
-    float t = atof(clean);
-    // Serial.print("  解析溫度: "); Serial.println(t, 3);  // 印 3 位小數
-
-    // === 解析濕度 ===
-    token = strtok(NULL, ",");
-    if (!token) {
-      // Serial.println("  無濕度欄位");
-      continue;
-    }
-    clean = token;
-    while (*clean == ' ') clean++;
-    end = clean + strlen(clean) - 1;
-    while (end > clean && (*end == ' ' || *end == '\r' || *end == '\n')) *end-- = '\0';
-    float h = atof(clean);
-    // Serial.print("  濕度: "); Serial.println(h, 1);
-
-    // === 繪圖 ===
-    int x = GRAPH_X + index;
-    int temp_y = tempToY(t);
-    int hum_y = humToY(h);
-
-    if (last_x >= 0) {
-      mylcd.Set_Draw_color(YELLOW); mylcd.Draw_Line(last_x, last_temp_y, x, temp_y);
-      mylcd.Set_Draw_color(CYAN);   mylcd.Draw_Line(last_x, last_hum_y, x, hum_y);
-    }
-
-    last_x = x; last_temp_y = temp_y; last_hum_y = hum_y;
-
-    if (tick_index <= TICK_COUNT && index % tick_interval == 0) {
-      ticks[tick_index++] = {x, record_time};
-    }
-
-    index++;
   }
   file.close();
 
-  // 畫點 + 刻度（不變）
+  // 畫最後一點
   if (last_x >= 0) {
     mylcd.Set_Draw_color(YELLOW); mylcd.Fill_Circle(last_x, last_temp_y, 2);
     mylcd.Set_Draw_color(CYAN);   mylcd.Fill_Circle(last_x, last_hum_y, 2);
   }
 
+  // 畫刻度
   mylcd.Set_Draw_color(BLACK);
   mylcd.Fill_Rectangle(GRAPH_X, GRAPH_BOTTOM + 6, GRAPH_X + GRAPH_W, GRAPH_BOTTOM + 20);
 
@@ -903,7 +849,6 @@ void drawGraphFromSD() {
     printWithBackground(buf, x, GRAPH_BOTTOM + 10, WHITE, BLACK, 2);
   }
 }
-
 
 void printWithBackground(const char* s, int x, int y, uint16_t textColor, uint16_t bgColor, uint8_t text_size) {
   int char_w = 6 * text_size; // 每個字元寬度（根據 Set_Text_Size(2)）
