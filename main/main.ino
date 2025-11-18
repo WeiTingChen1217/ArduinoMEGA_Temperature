@@ -54,20 +54,33 @@ struct Record {
 };
 
 SemaphoreHandle_t sdMutex;
+SemaphoreHandle_t lcdMutex;
+
 
 #define DISPLAY_TASK_SIZE 1024
-#define TRIM_BUFFER_SIZE 2048  // 可改成 2048、8192 等視 SRAM 而定
+#define TRIM_BUFFER_SIZE 1920  // 可改成 2048、8192 等視 SRAM 而定
 char trimBuffer[TRIM_BUFFER_SIZE];  // ✅ 放在全域，減少堆疊壓力
 //#define DEBUG_TRIM_LOG  // 註解掉這行即可關閉 trimOldRecords 的 log
+
+enum TimeAdjustMode { NONE, ADJUST_MINUTE, ADJUST_HOUR };
+TimeAdjustMode adjustMode = NONE;
+
+unsigned long adjustStartMillis = 0;
+DateTime adjustTime;  // 暫存調整中的時間
+volatile bool isAdjustingTime = false;
+
+bool force_set_compile_time = false;
+
 
 void setup() {
   Serial.begin(115200);
   // 初始化 SD 卡互斥鎖
   sdMutex = xSemaphoreCreateMutex();
+  lcdMutex = xSemaphoreCreateMutex();
 
   
   pinMode(BUTTON_PIN, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), buttonISR, FALLING);
+  // attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), buttonISR, FALLING);
 
   mylcd.Init_LCD();
   mylcd.Fill_Screen(BLACK);
@@ -99,8 +112,8 @@ void setup() {
   // 建立任務（堆疊加大）
   xTaskCreate(TaskRecordSensor, "RecordSensor", 1024, NULL, 2, NULL);
   xTaskCreate(TaskUpdateDisplay, "UpdateDisplay", DISPLAY_TASK_SIZE, NULL, 1, NULL);
-  xTaskCreate(TaskSerialCommand, "SerialCmd", 1024, NULL, 1, NULL);
-//  xTaskCreate(TaskButtonHandler, "ButtonHandler", 512, NULL, 1, NULL);  // 新增按鈕處理任務
+  // xTaskCreate(TaskSerialCommand, "SerialCmd", 1024, NULL, 1, NULL);
+  xTaskCreate(TaskButtonHandler, "ButtonHandler", 1024, NULL, 1, NULL);  // 新增按鈕處理任務
 }
 
 int countDataLines() {
@@ -232,6 +245,9 @@ bool compareAndSetStartTime() {
     start_time = file_time;
     Serial.println(F("採用檔案時間"));
   }
+
+  if(force_set_compile_time == true)
+    start_time = compile_time;
 
   // === 關鍵：先記錄 millis() ===
   start_millis = millis();
@@ -379,7 +395,10 @@ void TaskRecordSensor(void *pvParameters) {
     float h = dht.readHumidity();
 
     if (!isnan(t) && !isnan(h) && t > -40 && t < 80 && h >= 0 && h <= 100) {
-      updateTopLine(t, h, now);  // ✅ 每 2 秒更新畫面
+      if (!isAdjustingTime) {
+        updateTopLine(t, h, now);  // ✅ 每 2 秒更新畫面
+      }
+
 
       // ✅ 每 60 秒記錄一次資料
       if (millis() - lastLogMillis >= 60000) {
@@ -406,45 +425,27 @@ void TaskUpdateDisplay(void *pvParameters) {
   const TickType_t interval = 60000 / portTICK_PERIOD_MS;
   TickType_t lastWakeTime = xTaskGetTickCount();
   
-  static unsigned long lastTrimMillis = 0;
-  const unsigned long TRIM_INTERVAL = 300000UL; // 5 分鐘（毫秒）
-
   for (;;) {
     if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
       drawGraphFromSD();  // ✅ 圖表更新可能較久，獨立執行
       
       // ✅ 條件觸發 trim：資料超過 MAX_RECORDS 且距離上次 trim 足夠久
       int lines = countLines(FILENAME);
-      #ifdef DEBUG_TRIM_LOG
-      Serial.print("[UpdateDisplay] millis: ");
-      Serial.println(millis());
-      Serial.print("[UpdateDisplay] 啟動時 lastTrimMillis: ");
-      Serial.println(lastTrimMillis);
-      Serial.print("[UpdateDisplay] 資料筆數: ");
-      Serial.println(lines);
-      #endif
-      if (millis() - lastTrimMillis > TRIM_INTERVAL) {
-        if (lines > MAX_RECORDS + 1) {
-//          #ifdef DEBUG_TRIM_LOG
-          Serial.print("[UpdateDisplay] 開始 trimOldRecords...");
-          Serial.println(millis());
-          Serial.print("[trimOldRecords] Stack left: ");
-          Serial.println(uxTaskGetStackHighWaterMark(NULL));
-//          #endif
+      if (lines > MAX_RECORDS + 50) {
+        #ifdef DEBUG_TRIM_LOG
+        Serial.print(millis());
+        Serial.println("[trimOldRecords] 開始 trimOldRecords...");
+        Serial.print("[trimOldRecords] Stack left: ");
+        Serial.println(uxTaskGetStackHighWaterMark(NULL));
+        #endif
 
-          trimOldRecords();
+        trimOldRecords();
           
-//          #ifdef DEBUG_TRIM_LOG
-          Serial.print("[trimOldRecords] 完成搬移");
-          Serial.println(millis());
-          Serial.print("[trimOldRecords] Stack left: ");
-          Serial.println(uxTaskGetStackHighWaterMark(NULL));
-//          #endif
-          
-          lastTrimMillis = millis();
-        }
+        #ifdef DEBUG_TRIM_LOG
+        Serial.print(millis());
+        Serial.println("[trimOldRecords] 完成搬移");
+        #endif
       }
-
       xSemaphoreGive(sdMutex);
     }
 
@@ -481,19 +482,115 @@ void TaskSerialCommand(void *pvParameters) {
   }
 }
 
-void TaskButtonHandler(void *pvParameters) {
-  for (;;) {
-    if (button_pressed) {
-      button_pressed = false;
-      vTaskDelay(200 / portTICK_PERIOD_MS);  // debounce
-      if (digitalRead(BUTTON_PIN) == LOW) {
-        toggleScreen();
-      }
-    }
-    checkStack("ButtonHandler");
 
+void TaskButtonHandler(void *pvParameters) {
+  static unsigned long lastPressMillis = 0;
+  static bool lastState = HIGH;
+  const unsigned long LONG_PRESS_DURATION = 1000;
+  const unsigned long TIMEOUT_DURATION = 10000;
+  
+  for (;;) {
+    bool currentState = digitalRead(BUTTON_PIN);
+    unsigned long now = millis();
+    
+    if (currentState == LOW && lastState == HIGH) {
+      lastPressMillis = now;
+    }
+    
+    if (currentState == HIGH && lastState == LOW) {
+      unsigned long pressDuration = now - lastPressMillis;
+      isAdjustingTime = true;
+
+      if (pressDuration >= LONG_PRESS_DURATION) {
+        // 長按：切換模式
+        if (adjustMode == NONE) {
+          adjustMode = ADJUST_MINUTE;
+          adjustTime = getCurrentTime();
+          adjustStartMillis = now;
+          Serial.println("進入校正模式：分鐘");
+        } else if (adjustMode == ADJUST_MINUTE) {
+          adjustMode = ADJUST_HOUR;
+          Serial.println("切換到校正模式：小時");
+        } else {
+          adjustMode = ADJUST_MINUTE;
+          Serial.println("切換到校正模式：分鐘");
+        }
+      } else {
+        // 短按：+1
+        if (adjustMode == ADJUST_MINUTE) {
+          adjustTime = adjustTime + TimeSpan(0, 0, 1, 0);
+          Serial.print("分鐘 +1 → "); Serial.println(adjustTime.minute());
+        } else if (adjustMode == ADJUST_HOUR) {
+          adjustTime = adjustTime + TimeSpan(0, 1, 0, 0);
+          Serial.print("小時 +1 → "); Serial.println(adjustTime.hour());
+        }
+      }
+      drawTimeAdjustHint(adjustMode, adjustTime);
+    }
+    
+    // timeout
+    if (adjustMode != NONE && (now - adjustStartMillis > TIMEOUT_DURATION)) {
+      start_time = DateTime(adjustTime.year(), adjustTime.month(), adjustTime.day(),
+                            adjustTime.hour(), adjustTime.minute(), 0);
+      start_millis = millis();
+      updateLastTimeToSD(start_time);
+      Serial.println("⏱ 校時完成並儲存！");
+      adjustMode = NONE;
+      isAdjustingTime = false;
+    }
+    
+    lastState = currentState;
     vTaskDelay(50 / portTICK_PERIOD_MS);
   }
+}
+
+void clearTopLineArea() {
+  int screen_w = mylcd.Get_Display_Width();
+  int section_w = screen_w / 5;
+  int center_datetime = section_w * 3 / 2;
+  int center_temp = section_w * 3 + section_w / 2;
+  int center_hum = section_w * 4 + section_w / 2;
+
+  uint8_t text_size = 4;
+  int char_w = 6 * text_size;
+
+  // 清空三個區塊（用空白字串覆蓋）
+  printWithBackground("        ", center_datetime - 8 * char_w / 2, 40, BLACK, BLACK, text_size);
+  printWithBackground("        ", center_temp - 8 * char_w / 2, 40, BLACK, BLACK, text_size);
+  printWithBackground("        ", center_hum - 8 * char_w / 2, 40, BLACK, BLACK, text_size);
+}
+
+
+void drawTimeAdjustHint(TimeAdjustMode mode, DateTime time) {
+  int screen_w = mylcd.Get_Display_Width();
+  int section_w = screen_w / 5;
+
+  int center_datetime = section_w * 3 / 2;       // 左 3/5 的中間
+  int center_temp = section_w * 3 + section_w / 2; // 第 4 等分
+  int center_hum = section_w * 4 + section_w / 2;  // 第 5 等分
+
+  clearTopLineArea();
+
+  uint8_t text_size = 4;
+  int char_w = 6 * text_size;
+
+  // 顯示時間 + 日期
+  char datetime_str[20];
+  sprintf(datetime_str, "%02d:%02d %02d/%02d", time.hour(), time.minute(), time.month(), time.day());
+  printWithBackground(datetime_str, center_datetime - strlen(datetime_str) * char_w / 2, 40, WHITE, BLACK, text_size);
+
+  // 顯示模式提示
+  const char* mode_str = "";
+  uint16_t mode_color = WHITE;
+  if (mode == ADJUST_MINUTE) {
+    mode_str = "ADJUST_MINUTE";
+    mode_color = YELLOW;
+  } else if (mode == ADJUST_HOUR) {
+    mode_str = "ADJUST_HOUR";
+    mode_color = RED;
+  }
+
+  printWithBackground(mode_str, center_temp - strlen(mode_str) * char_w / 2, 40, mode_color, BLACK, text_size);
 }
 
 void toggleScreen() {
@@ -575,9 +672,7 @@ void updateTopLine(float t, float h, DateTime now) {
   int center_temp = section_w * 3 + section_w / 2; // 第 4 等分
   int center_hum = section_w * 4 + section_w / 2;  // 第 5 等分
 
-  mylcd.Set_Draw_color(BLACK);
-  mylcd.Fill_Rectangle(0, 30, screen_w, 60);
-  mylcd.Set_Text_Size(4);
+  clearTopLineArea();
 
   uint8_t text_size = 4;
   int char_w = 6 * text_size;
@@ -765,6 +860,8 @@ void drawYAxisLabels() {
 void drawGraphFromSD() {
   const int MAX_POINTS = GRAPH_W;
   const int TICK_COUNT = 4;
+  const int BYTES_PER_LINE = 40;
+  const int LINES_PER_BATCH = TRIM_BUFFER_SIZE / BYTES_PER_LINE;
 
   File file = SD.open(FILENAME);
   if (!file) {
@@ -774,25 +871,22 @@ void drawGraphFromSD() {
 
   file.readStringUntil('\n'); // 跳過 header
 
-  // 計算總筆數
+  // 預先計算總筆數
   int total_lines = 0;
   while (file.available()) {
     if (file.readStringUntil('\n').length() > 0) total_lines++;
   }
   file.close();
 
-  if (total_lines == 0) {
-    Serial.println("無資料");
-    return;
-  }
-
   int skip_lines = max(0, total_lines - MAX_POINTS);
-  file = SD.open(FILENAME);
-  file.readStringUntil('\n');
 
+  // 重新開啟並跳過 header + skip_lines
+  file = SD.open(FILENAME);
+  file.readStringUntil('\n'); // 跳過 header
   for (int i = 0; i < skip_lines; i++) {
     file.readStringUntil('\n');
   }
+
 
   mylcd.Set_Draw_color(BLACK);
   mylcd.Fill_Rectangle(GRAPH_X, GRAPH_Y, GRAPH_X + GRAPH_W, GRAPH_BOTTOM);
@@ -800,99 +894,60 @@ void drawGraphFromSD() {
   int last_x = -1, last_temp_y = -1, last_hum_y = -1;
   int index = 0;
   int tick_interval = MAX_POINTS / TICK_COUNT;
-
   struct Tick { int x; DateTime time; } ticks[TICK_COUNT + 1];
   int tick_index = 0;
 
-  char line[96];
   while (file.available() && index < MAX_POINTS) {
-    size_t len = file.readBytesUntil('\n', line, sizeof(line) - 1);
-    if (len == 0) break;
-    line[len] = '\0';
+    for (int i = 0; i < LINES_PER_BATCH && file.available() && index < MAX_POINTS; i++) {
+      size_t len = file.readBytesUntil('\n', trimBuffer, TRIM_BUFFER_SIZE - 1);
+      if (len == 0) continue;
+      trimBuffer[len] = '\0';
 
-    // // === 關鍵 Debug：印出原始資料 ===
-    // Serial.print("RAW [");
-    // Serial.print(index);
-    // Serial.print("]: ");
-    // Serial.println(line);
+      char* token = strtok(trimBuffer, ",");
+      if (!token) continue;
 
-    // === 解析時間 ===
-    char* token = strtok(line, ",");
-    if (!token) {
-      // Serial.println("  解析失敗：無時間");
-      continue;
+      int y, mo, d, hr, mi;
+      if (sscanf(token, "%d-%d-%d %d:%d", &y, &mo, &d, &hr, &mi) != 5) continue;
+      DateTime record_time(y, mo, d, hr, mi, 0);
+
+      token = strtok(NULL, ",");
+      if (!token) continue;
+      float t = atof(token);
+
+      token = strtok(NULL, ",");
+      if (!token) continue;
+      float h = atof(token);
+
+      int x = GRAPH_X + index;
+      int temp_y = tempToY(t);
+      int hum_y = humToY(h);
+
+      if (last_x >= 0) {
+        mylcd.Set_Draw_color(YELLOW); mylcd.Draw_Line(last_x, last_temp_y, x, temp_y);
+        mylcd.Set_Draw_color(CYAN);   mylcd.Draw_Line(last_x, last_hum_y, x, hum_y);
+      }
+
+      last_x = x; last_temp_y = temp_y; last_hum_y = hum_y;
+
+      if (tick_index <= TICK_COUNT && index % tick_interval == 0) {
+        ticks[tick_index++] = {x, record_time};
+      }
+
+      index++;
     }
-    // Serial.print("  時間: "); Serial.println(token);
-
-    int y, mo, d, hr, mi;
-    if (sscanf(token, "%d-%d-%d %d:%d:00", &y, &mo, &d, &hr, &mi) != 5) {
-      // Serial.println("  時間格式錯誤");
-      continue;
-    }
-    DateTime record_time(y, mo, d, hr, mi, 0);
-
-    // === 解析溫度 ===
-    token = strtok(NULL, ",");
-    if (!token) {
-      // Serial.println("  無溫度欄位");
-      continue;
-    }
-    // Serial.print("  溫度字串: ["); Serial.print(token); Serial.println("]");
-
-    // 清理空白
-    char* clean = token;
-    while (*clean == ' ') clean++;
-    char* end = clean + strlen(clean) - 1;
-    while (end > clean && (*end == ' ' || *end == '\r' || *end == '\n')) *end-- = '\0';
-
-    float t = atof(clean);
-    // Serial.print("  解析溫度: "); Serial.println(t, 3);  // 印 3 位小數
-
-    // === 解析濕度 ===
-    token = strtok(NULL, ",");
-    if (!token) {
-      // Serial.println("  無濕度欄位");
-      continue;
-    }
-    clean = token;
-    while (*clean == ' ') clean++;
-    end = clean + strlen(clean) - 1;
-    while (end > clean && (*end == ' ' || *end == '\r' || *end == '\n')) *end-- = '\0';
-    float h = atof(clean);
-    // Serial.print("  濕度: "); Serial.println(h, 1);
-
-    // === 繪圖 ===
-    int x = GRAPH_X + index;
-    int temp_y = tempToY(t);
-    int hum_y = humToY(h);
-
-    if (last_x >= 0) {
-      mylcd.Set_Draw_color(YELLOW); mylcd.Draw_Line(last_x, last_temp_y, x, temp_y);
-      mylcd.Set_Draw_color(CYAN);   mylcd.Draw_Line(last_x, last_hum_y, x, hum_y);
-    }
-
-    last_x = x; last_temp_y = temp_y; last_hum_y = hum_y;
-
-    if (tick_index <= TICK_COUNT && index % tick_interval == 0) {
-      ticks[tick_index++] = {x, record_time};
-    }
-
-    index++;
   }
   file.close();
 
-  // 畫點 + 刻度（不變）
+  // 畫最後一點
   if (last_x >= 0) {
     mylcd.Set_Draw_color(YELLOW); mylcd.Fill_Circle(last_x, last_temp_y, 2);
     mylcd.Set_Draw_color(CYAN);   mylcd.Fill_Circle(last_x, last_hum_y, 2);
   }
 
+  // 畫刻度
   mylcd.Set_Draw_color(BLACK);
   mylcd.Fill_Rectangle(GRAPH_X, GRAPH_BOTTOM + 6, GRAPH_X + GRAPH_W, GRAPH_BOTTOM + 20);
 
-  mylcd.Set_Text_Size(2);
-  mylcd.Set_Text_colour(WHITE);
-  mylcd.Set_Text_Back_colour(BLACK);
   for (int i = 0; i < tick_index; i++) {
     mylcd.Draw_Fast_VLine(ticks[i].x, GRAPH_BOTTOM, 5);
     char buf[6]; sprintf(buf, "%02d:%02d", ticks[i].time.hour(), ticks[i].time.minute());
@@ -904,18 +959,18 @@ void drawGraphFromSD() {
   }
 }
 
-
 void printWithBackground(const char* s, int x, int y, uint16_t textColor, uint16_t bgColor, uint8_t text_size) {
-  int char_w = 6 * text_size; // 每個字元寬度（根據 Set_Text_Size(2)）
-  int char_h = 8 * text_size; // 每個字元高度（根據 Set_Text_Size(2)）
-  int text_w = strlen(s) * char_w;
+  if (xSemaphoreTake(lcdMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+    int char_w = 6 * text_size; // 每個字元寬度（根據 Set_Text_Size(2)）
+    int char_h = 8 * text_size; // 每個字元高度（根據 Set_Text_Size(2)）
+    int text_w = strlen(s) * char_w;
+    mylcd.Set_Text_Size(text_size);
+    mylcd.Set_Draw_color(bgColor);
+    mylcd.Fill_Rectangle(x, y, x + text_w, y + char_h);
 
-  mylcd.Set_Text_Size(text_size);
-  mylcd.Set_Draw_color(bgColor);
-  mylcd.Fill_Rectangle(x, y, x + text_w, y + char_h);
-
-  mylcd.Set_Text_colour(textColor);
-  mylcd.Set_Text_Back_colour(bgColor); // ✅ 加上這行，確保文字底色一致
-  mylcd.Print_String(s, x, y);
-
+    mylcd.Set_Text_colour(textColor);
+    mylcd.Set_Text_Back_colour(bgColor); // ✅ 加上這行，確保文字底色一致
+    mylcd.Print_String(s, x, y);
+    xSemaphoreGive(lcdMutex);
+  }
 }
