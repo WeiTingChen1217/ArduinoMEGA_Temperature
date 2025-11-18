@@ -42,7 +42,7 @@ unsigned long start_millis;
 const char LAST_TIME_FILE[] = "lasttime.txt";  // 存啟動時間
 
 
-#define BUTTON_PIN 2
+#define BUTTON_PIN A2
 
 volatile bool button_pressed = false;
 bool screen_on = true;
