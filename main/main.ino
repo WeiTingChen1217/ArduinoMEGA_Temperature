@@ -425,45 +425,27 @@ void TaskUpdateDisplay(void *pvParameters) {
   const TickType_t interval = 60000 / portTICK_PERIOD_MS;
   TickType_t lastWakeTime = xTaskGetTickCount();
   
-  static unsigned long lastTrimMillis = 0;
-  const unsigned long TRIM_INTERVAL = 300000UL; // 5 分鐘（毫秒）
-
   for (;;) {
     if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
       drawGraphFromSD();  // ✅ 圖表更新可能較久，獨立執行
       
       // ✅ 條件觸發 trim：資料超過 MAX_RECORDS 且距離上次 trim 足夠久
       int lines = countLines(FILENAME);
-      #ifdef DEBUG_TRIM_LOG
-      Serial.print("[UpdateDisplay] millis: ");
-      Serial.println(millis());
-      Serial.print("[UpdateDisplay] 啟動時 lastTrimMillis: ");
-      Serial.println(lastTrimMillis);
-      Serial.print("[UpdateDisplay] 資料筆數: ");
-      Serial.println(lines);
-      #endif
-      if (millis() - lastTrimMillis > TRIM_INTERVAL) {
-        if (lines > MAX_RECORDS + 1) {
-//          #ifdef DEBUG_TRIM_LOG
-          Serial.print("[UpdateDisplay] 開始 trimOldRecords...");
-          Serial.println(millis());
-          Serial.print("[trimOldRecords] Stack left: ");
-          Serial.println(uxTaskGetStackHighWaterMark(NULL));
-//          #endif
+      if (lines > MAX_RECORDS + 50) {
+        #ifdef DEBUG_TRIM_LOG
+        Serial.print(millis());
+        Serial.println("[trimOldRecords] 開始 trimOldRecords...");
+        Serial.print("[trimOldRecords] Stack left: ");
+        Serial.println(uxTaskGetStackHighWaterMark(NULL));
+        #endif
 
-          trimOldRecords();
+        trimOldRecords();
           
-//          #ifdef DEBUG_TRIM_LOG
-          Serial.print("[trimOldRecords] 完成搬移");
-          Serial.println(millis());
-          Serial.print("[trimOldRecords] Stack left: ");
-          Serial.println(uxTaskGetStackHighWaterMark(NULL));
-//          #endif
-          
-          lastTrimMillis = millis();
-        }
+        #ifdef DEBUG_TRIM_LOG
+        Serial.print(millis());
+        Serial.println("[trimOldRecords] 完成搬移");
+        #endif
       }
-
       xSemaphoreGive(sdMutex);
     }
 
