@@ -54,9 +54,11 @@ struct Record {
 };
 
 SemaphoreHandle_t sdMutex;
+SemaphoreHandle_t lcdMutex;
+
 
 #define DISPLAY_TASK_SIZE 1024
-#define TRIM_BUFFER_SIZE 2048  // 可改成 2048、8192 等視 SRAM 而定
+#define TRIM_BUFFER_SIZE 1920  // 可改成 2048、8192 等視 SRAM 而定
 char trimBuffer[TRIM_BUFFER_SIZE];  // ✅ 放在全域，減少堆疊壓力
 //#define DEBUG_TRIM_LOG  // 註解掉這行即可關閉 trimOldRecords 的 log
 
@@ -74,6 +76,7 @@ void setup() {
   Serial.begin(115200);
   // 初始化 SD 卡互斥鎖
   sdMutex = xSemaphoreCreateMutex();
+  lcdMutex = xSemaphoreCreateMutex();
 
   
   pinMode(BUTTON_PIN, INPUT_PULLUP);
@@ -975,16 +978,17 @@ void drawGraphFromSD() {
 }
 
 void printWithBackground(const char* s, int x, int y, uint16_t textColor, uint16_t bgColor, uint8_t text_size) {
-  int char_w = 6 * text_size; // 每個字元寬度（根據 Set_Text_Size(2)）
-  int char_h = 8 * text_size; // 每個字元高度（根據 Set_Text_Size(2)）
-  int text_w = strlen(s) * char_w;
+  if (xSemaphoreTake(lcdMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+    int char_w = 6 * text_size; // 每個字元寬度（根據 Set_Text_Size(2)）
+    int char_h = 8 * text_size; // 每個字元高度（根據 Set_Text_Size(2)）
+    int text_w = strlen(s) * char_w;
+    mylcd.Set_Text_Size(text_size);
+    mylcd.Set_Draw_color(bgColor);
+    mylcd.Fill_Rectangle(x, y, x + text_w, y + char_h);
 
-  mylcd.Set_Text_Size(text_size);
-  mylcd.Set_Draw_color(bgColor);
-  mylcd.Fill_Rectangle(x, y, x + text_w, y + char_h);
-
-  mylcd.Set_Text_colour(textColor);
-  mylcd.Set_Text_Back_colour(bgColor); // ✅ 加上這行，確保文字底色一致
-  mylcd.Print_String(s, x, y);
-
+    mylcd.Set_Text_colour(textColor);
+    mylcd.Set_Text_Back_colour(bgColor); // ✅ 加上這行，確保文字底色一致
+    mylcd.Print_String(s, x, y);
+    xSemaphoreGive(lcdMutex);
+  }
 }
