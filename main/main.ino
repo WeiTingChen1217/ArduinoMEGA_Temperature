@@ -34,8 +34,8 @@ int GRAPH_BOTTOM = 0;
 
 #define TEMP_MIN 22
 #define TEMP_MAX 30
-#define HUM_MIN 50
-#define HUM_MAX 100
+#define HUM_MIN 45
+#define HUM_MAX 80
 
 DateTime start_time;
 unsigned long start_millis;
@@ -304,20 +304,6 @@ void updateLastTimeToSD(DateTime time) {
   }
 }
 
-void saveLastTime() {
-  SD.remove(LAST_TIME_FILE);
-  File file = SD.open(LAST_TIME_FILE, FILE_WRITE);
-  if (!file) return;
-
-  char buf[20];
-  sprintf(buf, "%04d-%02d-%02d %02d:%02d:%02d",
-          start_time.year(), start_time.month(), start_time.day(),
-          start_time.hour(), start_time.minute(), start_time.second());
-  file.println(buf);
-  file.close();
-  Serial.print("儲存啟動時間: "); Serial.println(buf);
-}
-
 DateTime getCurrentTime() {
   unsigned long elapsed = millis() - start_millis;
   // 處理溢位
@@ -455,10 +441,19 @@ void TaskUpdateDisplay(void *pvParameters) {
 }
 
 void TaskSerialCommand(void *pvParameters) {
-  static String cmdBuffer = "";
 
   for (;;) {
-    while (Serial.available()) {
+    SerialCommand();
+    checkStack("SerialCmd");
+
+    vTaskDelay(100 / portTICK_PERIOD_MS);
+  }
+}
+
+void SerialCommand(void) {
+  String cmdBuffer = "";
+
+  while (Serial.available()) {
       char c = Serial.read();
       if (c == '\n') {
         cmdBuffer.trim();
@@ -470,16 +465,38 @@ void TaskSerialCommand(void *pvParameters) {
           }else{
             Serial.println("fail to erase");
           }
+        } else if (cmdBuffer == "GETTIME") {
+          DateTime now = getCurrentTime();
+          char buf[25];
+          sprintf(buf, "%04d-%02d-%02d %02d:%02d:%02d",
+                  now.year(), now.month(), now.day(),
+                  now.hour(), now.minute(), now.second());
+          Serial.print("TIME "); Serial.println(buf);
+        } else if (cmdBuffer.startsWith("SETTIME")) {
+          delay(500);
+          int y, mo, d, h, mi, s;
+          if (sscanf(cmdBuffer.c_str(), "SETTIME %04d-%02d-%02d %02d:%02d:%02d",
+                     &y, &mo, &d, &h, &mi, &s) == 6) {
+            start_time = DateTime(y, mo, d, h, mi, s);
+            start_millis = millis();
+            if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+              updateLastTimeToSD(start_time);
+              xSemaphoreGive(sdMutex);
+            } else {
+              Serial.println("SD busy, skip update");
+            }
+
+            Serial.println("時間已更新！");
+          } else {
+            Serial.println("SETTIME 格式錯誤，應為 yyyy-MM-dd HH:mm:ss");
+          }
         }
+
         cmdBuffer = "";
       } else {
         cmdBuffer += c;
       }
     }
-    checkStack("SerialCmd");
-
-    vTaskDelay(100 / portTICK_PERIOD_MS);
-  }
 }
 
 
@@ -540,6 +557,9 @@ void TaskButtonHandler(void *pvParameters) {
     }
     
     lastState = currentState;
+
+    SerialCommand();
+
     vTaskDelay(50 / portTICK_PERIOD_MS);
   }
 }
@@ -687,6 +707,16 @@ void updateTopLine(float t, float h, DateTime now) {
   strcpy(last_datetime, datetime_str);
   strcpy(last_temp, temp_str);
   strcpy(last_hum, hum_str);
+
+  // 🔧 新增序列輸出
+  // [TopLine] 13:28 12/24 | 26C | 60%
+  Serial.print("[TopLine] ");
+  Serial.print(datetime_str);
+  Serial.print(" | ");
+  Serial.print(temp_str);
+  Serial.print(" | ");
+  Serial.println(hum_str);
+
 }
 
 
