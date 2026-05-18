@@ -58,7 +58,7 @@ SemaphoreHandle_t lcdMutex;
 
 
 #define DISPLAY_TASK_SIZE 1024
-#define TRIM_BUFFER_SIZE 1920  // 可改成 2048、8192 等視 SRAM 而定
+#define TRIM_BUFFER_SIZE 1792  // 可改成 2048、8192 等視 SRAM 而定
 char trimBuffer[TRIM_BUFFER_SIZE];  // ✅ 放在全域，減少堆疊壓力
 //#define DEBUG_TRIM_LOG  // 註解掉這行即可關閉 trimOldRecords 的 log
 
@@ -140,7 +140,7 @@ void ensureFullData() {
   int currentLines = countDataLines();  // 計算資料筆數（不含 header）
 
   if (currentLines >= MAX_RECORDS) {
-    Serial.print("資料已足夠：");
+    Serial.print("資料已足夠:");
     Serial.print(currentLines);
     Serial.println(" 筆，無需補充");
     xSemaphoreGive(sdMutex);
@@ -216,8 +216,8 @@ bool compareAndSetStartTime() {
   sprintf(compile_str, "%04d-%02d-%02d %02d:%02d:%02d",
           compile_time.year(), compile_time.month(), compile_time.day(),
           compile_time.hour(), compile_time.minute(), compile_time.second());
-  Serial.print(F("編譯時間: "));
-  Serial.println(compile_str);
+  // Serial.print(F("編譯時間: "));
+  // Serial.println(compile_str);
 
   DateTime file_time(1970, 1, 1, 0, 0, 0);
   bool file_valid = false;
@@ -240,10 +240,10 @@ bool compareAndSetStartTime() {
 
   if (!file_valid || compile_time >= file_time) {
     start_time = compile_time;
-    Serial.println(F("採用編譯時間"));
+    // Serial.println(F("採用編譯時間"));
   } else {
     start_time = file_time;
-    Serial.println(F("採用檔案時間"));
+    // Serial.println(F("採用檔案時間"));
   }
 
   if(force_set_compile_time == true)
@@ -300,7 +300,9 @@ void updateLastTimeToSD(DateTime time) {
     sprintf(buf, "%04d-%02d-%02d %02d:%02d:%02d", time.year(), time.month(), time.day(), time.hour(), time.minute(), time.second());
     time_file.println(buf);
     time_file.close();
-    Serial.print("[updateLastTimeToSD] 儲存時間: "); Serial.println(buf);
+    // Serial.print("[updateLastTimeToSD] save the time to sd card"); Serial.println(buf);
+  }else{
+    Serial.println("[updateLastTimeToSD] fail to open lasttime.txt");
   }
 }
 
@@ -415,23 +417,8 @@ void TaskUpdateDisplay(void *pvParameters) {
     if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
       drawGraphFromSD();  // ✅ 圖表更新可能較久，獨立執行
       
-      // ✅ 條件觸發 trim：資料超過 MAX_RECORDS 且距離上次 trim 足夠久
-      int lines = countLines(FILENAME);
-      if (lines > MAX_RECORDS + 50) {
-        #ifdef DEBUG_TRIM_LOG
-        Serial.print(millis());
-        Serial.println("[trimOldRecords] 開始 trimOldRecords...");
-        Serial.print("[trimOldRecords] Stack left: ");
-        Serial.println(uxTaskGetStackHighWaterMark(NULL));
-        #endif
+      trimOldRecords();
 
-        trimOldRecords();
-          
-        #ifdef DEBUG_TRIM_LOG
-        Serial.print(millis());
-        Serial.println("[trimOldRecords] 完成搬移");
-        #endif
-      }
       xSemaphoreGive(sdMutex);
     }
 
@@ -756,8 +743,22 @@ int countLines(const char* filename) {
 }
 
 void trimOldRecords() {
+  // ✅ 條件觸發 trim：資料超過 MAX_RECORDS 且距離上次 trim 足夠久
+
+  int lines = countLines(FILENAME);
+  if (lines < MAX_RECORDS + 50) {
+    return;
+  }
+  Serial.print("[trimOldRecords] ");
+  Serial.print(lines);
+  Serial.println(" lines");
+
+  Serial.print("[trimOldRecords] ");
+  Serial.print(millis());
+  Serial.println(" 開始 trimOldRecords...");
   #ifdef DEBUG_TRIM_LOG
-  Serial.println("[trimOldRecords] 開始執行");
+  Serial.print("[trimOldRecords] Stack left: ");
+  Serial.println(uxTaskGetStackHighWaterMark(NULL));
   #endif
 
   File src = SD.open(FILENAME, FILE_READ);
@@ -850,9 +851,9 @@ void trimOldRecords() {
     #endif
   }
 
-  #ifdef DEBUG_TRIM_LOG
-  Serial.println("[trimOldRecords] 執行結束");
-  #endif
+  Serial.print("[trimOldRecords] ");
+  Serial.print(millis());
+  Serial.println(" 完成搬移");
 }
 
 int tempToY(float temp) {
