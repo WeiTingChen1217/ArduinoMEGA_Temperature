@@ -31,9 +31,11 @@ int GRAPH_Y = 80;
 int GRAPH_W = 0;
 int GRAPH_H = 160;
 int GRAPH_BOTTOM = 0;
+// 軸線下緣到螢幕底：刻度 5px、HH:MM 從 +10 起、字高 16、再留 2px
+const int GRAPH_TIME_LABEL_H = 28;
 
 #define TEMP_MIN 22
-#define TEMP_MAX 30
+#define TEMP_MAX 35
 #define HUM_MIN 45
 #define HUM_MAX 80
 
@@ -63,7 +65,8 @@ SemaphoreHandle_t sdMutex;
 SemaphoreHandle_t lcdMutex;
 
 
-#define DISPLAY_TASK_SIZE 1024
+#define DISPLAY_TASK_SIZE 1280
+#define RECORD_TASK_SIZE 1280
 #define GRAPH_POINT_MAX 400
 #define TRIM_MARGIN 50
 const char CSV_HEADER[] = "Timestamp,Temperature_C,Humidity_%";
@@ -220,11 +223,15 @@ void setup() {
 
   mylcd.Init_LCD();
   mylcd.Fill_Screen(BLACK);
-  mylcd.Set_Rotation(1);
+  // 3 = 270°。相對原本的橫向再轉 180°，產品倒放時畫面仍是正的。
+  mylcd.Set_Rotation(3);
 
   int screen_w = mylcd.Get_Display_Width();
+  int screen_h = mylcd.Get_Display_Height();
   GRAPH_W = screen_w - GRAPH_X - 20;
-  GRAPH_BOTTOM = GRAPH_Y + GRAPH_H;
+  GRAPH_BOTTOM = screen_h - GRAPH_TIME_LABEL_H;
+  if (GRAPH_BOTTOM < GRAPH_Y + 40) GRAPH_BOTTOM = GRAPH_Y + 40;
+  GRAPH_H = GRAPH_BOTTOM - GRAPH_Y;
 
   dht.begin();
   pinMode(chipSelect, OUTPUT);
@@ -248,7 +255,7 @@ void setup() {
   ensureFullData();
 //  drawGraphFromSD();
   // 建立任務（堆疊加大）
-  xTaskCreate(TaskRecordSensor, "RecordSensor", 1024, NULL, 2, NULL);
+  xTaskCreate(TaskRecordSensor, "RecordSensor", RECORD_TASK_SIZE, NULL, 2, NULL);
   xTaskCreate(TaskUpdateDisplay, "UpdateDisplay", DISPLAY_TASK_SIZE, NULL, 1, NULL);
   // xTaskCreate(TaskSerialCommand, "SerialCmd", 1024, NULL, 1, NULL);
   xTaskCreate(TaskButtonHandler, "ButtonHandler", 1024, NULL, 1, NULL);  // 新增按鈕處理任務
@@ -445,6 +452,89 @@ DateTime getCurrentTime() {
   return start_time + TimeSpan(elapsed / 1000);
 }
 
+static const char DRIFT_LOG[] = "drift.log";
+static const uint32_t DRIFT_LOG_MAX = 2UL * 1024UL * 1024UL;
+
+static int formatTemp10(char* dst, int dstSize, float tempC) {
+  if (isnan(tempC) || dstSize < 8) return 0;
+  int t10 = (int)(tempC * 10.0f + (tempC >= 0.0f ? 0.5f : -0.5f));
+  int neg = 0;
+  if (t10 < 0) {
+    neg = 1;
+    t10 = -t10;
+  }
+  return snprintf(dst, dstSize, " %s%d.%d", neg ? "-" : "", t10 / 10, t10 % 10);
+}
+
+static bool appendDriftLine(const char* line) {
+  if (!takeSd(800)) return false;
+  File file = SD.open(DRIFT_LOG, FILE_WRITE);
+  bool ok = false;
+  if (!file) {
+    giveSd();
+    return false;
+  }
+  if (file.size() < DRIFT_LOG_MAX) {
+    ok = file.println(line) > 0;
+  }
+  file.close();
+  giveSd();
+  return ok;
+}
+
+static void logDriftSample(DateTime now, float tempC) {
+  char buf[64];
+  int n = snprintf(buf, sizeof(buf), "DRIFT %lu %04d-%02d-%02d %02d:%02d:%02d",
+                   millis(),
+                   now.year(), now.month(), now.day(),
+                   now.hour(), now.minute(), now.second());
+  if (n > 0 && n < (int)sizeof(buf)) formatTemp10(buf + n, (int)sizeof(buf) - n, tempC);
+  appendDriftLine(buf);
+}
+
+static void logTimeSync(DateTime time) {
+  char buf[48];
+  snprintf(buf, sizeof(buf), "SYNC %lu %04d-%02d-%02d %02d:%02d:%02d",
+           millis(),
+           time.year(), time.month(), time.day(),
+           time.hour(), time.minute(), time.second());
+  if (!appendDriftLine(buf)) Serial.println(F("[drift] SYNC write failed"));
+}
+
+static void printDriftLog() {
+  logDriftSample(getCurrentTime(), dht.readTemperature());
+  if (!takeSd(3000)) {
+    Serial.println(F("[drift] SD busy"));
+    return;
+  }
+  File file = SD.open(DRIFT_LOG, FILE_READ);
+  if (!file) {
+    giveSd();
+    Serial.println(F("[drift] no drift.log"));
+    return;
+  }
+  Serial.println(F("[drift] begin"));
+  while (file.available()) {
+    int n = file.read((uint8_t*)sdBlock, (uint16_t)sizeof(sdBlock));
+    if (n <= 0) break;
+    Serial.write((const uint8_t*)sdBlock, n);
+  }
+  file.close();
+  giveSd();
+  Serial.flush();
+  Serial.println(F("[drift] end"));
+}
+
+static void clearDriftLog() {
+  if (!takeSd(2000)) {
+    Serial.println(F("[drift] SD busy"));
+    return;
+  }
+  SD.remove(DRIFT_LOG);
+  giveSd();
+  Serial.println(F("[drift] cleared"));
+}
+
 void buttonISR() { button_pressed = true; }
 
 void loop() {
@@ -487,7 +577,7 @@ void loop() {
     cmd.trim();
     if (cmd == "CLEAR") {
       clearCSV();
-      Serial.println("📁 temp.csv 已清空");
+      Serial.println("temp.csv 已清空");
     }
   }
 */
@@ -495,10 +585,27 @@ void loop() {
 
 void checkStack(const char* taskName) {
   UBaseType_t stackLeft = uxTaskGetStackHighWaterMark(NULL);
-  if (stackLeft < 50) {
-    Serial.print("["); Serial.print(taskName); Serial.print("] ⚠️ Stack low: ");
-    Serial.println(stackLeft);
+  if (stackLeft >= 16) return;
+
+  struct Mark {
+    const char* name;
+    UBaseType_t left;
+  };
+  static Mark marks[3];
+  for (int i = 0; i < 3; i++) {
+    if (marks[i].name == NULL) {
+      marks[i].name = taskName;
+      marks[i].left = stackLeft;
+      break;
+    }
+    if (strcmp(marks[i].name, taskName) == 0) {
+      if (stackLeft >= marks[i].left) return;
+      marks[i].left = stackLeft;
+      break;
+    }
   }
+  Serial.print("["); Serial.print(taskName); Serial.print("] Stack low: ");
+  Serial.println(stackLeft);
 }
 
 void TaskRecordSensor(void *pvParameters) {
@@ -506,11 +613,18 @@ void TaskRecordSensor(void *pvParameters) {
   TickType_t lastWakeTime = xTaskGetTickCount();
 
   static unsigned long lastLogMillis = 0;
+  static unsigned long lastDriftPrint = 0;
 
   for (;;) {
     DateTime now = getCurrentTime();
     float t = dht.readTemperature();
     float h = dht.readHumidity();
+    unsigned long ms = millis();
+
+    if (lastDriftPrint == 0 || ms - lastDriftPrint >= 60000UL) {
+      lastDriftPrint = ms;
+      logDriftSample(now, t);
+    }
 
     if (!isnan(t) && !isnan(h) && t > -40 && t < 80 && h >= 0 && h <= 100) {
       if (!isAdjustingTime) {
@@ -585,6 +699,10 @@ void SerialCommand(void) {
     if (strcmp(start, "CLEAR") == 0) {
       if (clearCSV()) Serial.println(F("temp.csv 已清空"));
       else Serial.println(F("fail to erase"));
+    } else if (strcmp(start, "PRINTLOG") == 0) {
+      printDriftLog();
+    } else if (strcmp(start, "CLEARLOG") == 0) {
+      clearDriftLog();
     } else if (strcmp(start, "GETTIME") == 0) {
       DateTime now = getCurrentTime();
       char buf[25];
@@ -601,6 +719,7 @@ void SerialCommand(void) {
         start_time = DateTime(y, mo, d, h, mi, s);
         start_millis = millis();
         updateLastTimeToSD(start_time);
+        logTimeSync(start_time);
         Serial.println(F("時間已更新！"));
       } else {
         Serial.println(F("SETTIME 格式錯誤，應為 yyyy-MM-dd HH:mm:ss"));
@@ -646,10 +765,10 @@ void TaskButtonHandler(void *pvParameters) {
         // 短按：+1
         if (adjustMode == ADJUST_MINUTE) {
           adjustTime = adjustTime + TimeSpan(0, 0, 1, 0);
-          Serial.print("分鐘 +1 → "); Serial.println(adjustTime.minute());
+          Serial.print("分鐘 +1 "); Serial.println(adjustTime.minute());
         } else if (adjustMode == ADJUST_HOUR) {
           adjustTime = adjustTime + TimeSpan(0, 1, 0, 0);
-          Serial.print("小時 +1 → "); Serial.println(adjustTime.hour());
+          Serial.print("小時 +1 "); Serial.println(adjustTime.hour());
         }
       }
       drawTimeAdjustHint(adjustMode, adjustTime);
@@ -661,7 +780,8 @@ void TaskButtonHandler(void *pvParameters) {
                             adjustTime.hour(), adjustTime.minute(), 0);
       start_millis = millis();
       updateLastTimeToSD(start_time);
-      Serial.println("⏱ 校時完成並儲存！");
+      logTimeSync(start_time);
+      Serial.println("校時完成並儲存");
       adjustMode = NONE;
       isAdjustingTime = false;
     }
@@ -780,11 +900,14 @@ void drawAxes() {
   mylcd.Draw_Rectangle(GRAPH_X - 1, GRAPH_Y - 1, GRAPH_X + GRAPH_W + 1, GRAPH_BOTTOM + 1);
 
   mylcd.Set_Text_Size(2);
-  for (int t = TEMP_MIN; t <= TEMP_MAX; t += 2) {
-    int y = tempToY(t);
+  for (int t = TEMP_MIN;;) {
+    int label = (TEMP_MAX - t < 2) ? TEMP_MAX : t;
+    int y = tempToY(label);
     mylcd.Set_Text_colour(YELLOW);
     mylcd.Set_Text_Back_colour(BLACK);
     mylcd.Draw_Fast_HLine(GRAPH_X - 5, y, 5);
+    if (label == TEMP_MAX) break;
+    t += 2;
   }
   for (int h = HUM_MIN; h <= HUM_MAX; h += 10) {
     int y = humToY(h);
@@ -999,12 +1122,15 @@ int humToY(float hum) {
 void drawYAxisLabels() {
   mylcd.Set_Text_Size(2);
 
-  for (int t = TEMP_MIN; t <= TEMP_MAX; t += 2) {
-    int y = tempToY(t);
+  for (int t = TEMP_MIN;;) {
+    int label = (TEMP_MAX - t < 2) ? TEMP_MAX : t;
+    int y = tempToY(label);
     mylcd.Set_Text_colour(YELLOW);
     char buf[8];
-    sprintf(buf, "%dC", t);
+    sprintf(buf, "%dC", label);
     mylcd.Print_String(buf, 0, y - 6);
+    if (label == TEMP_MAX) break;
+    t += 2;
   }
 
   for (int h = HUM_MIN; h <= HUM_MAX; h += 10) {
@@ -1150,7 +1276,10 @@ static bool drawGraphPoints(int count, const GraphTick* ticks, int tickCount) {
   }
 
   mylcd.Set_Draw_color(BLACK);
-  mylcd.Fill_Rectangle(GRAPH_X, GRAPH_BOTTOM + 6, GRAPH_X + GRAPH_W, GRAPH_BOTTOM + 25);
+  int label_bottom = GRAPH_BOTTOM + GRAPH_TIME_LABEL_H - 2;
+  int screen_h = mylcd.Get_Display_Height();
+  if (label_bottom >= screen_h) label_bottom = screen_h - 1;
+  mylcd.Fill_Rectangle(GRAPH_X, GRAPH_BOTTOM + 6, GRAPH_X + GRAPH_W, label_bottom);
   for (int i = 0; i < tickCount; i++) {
     mylcd.Draw_Fast_VLine(ticks[i].x, GRAPH_BOTTOM, 5);
     char buf[6];
