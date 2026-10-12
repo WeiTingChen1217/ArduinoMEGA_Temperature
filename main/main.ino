@@ -31,9 +31,11 @@ int GRAPH_Y = 80;
 int GRAPH_W = 0;
 int GRAPH_H = 160;
 int GRAPH_BOTTOM = 0;
+// 軸線下緣到螢幕底：刻度 5px、HH:MM 從 +10 起、字高 16、再留 2px
+const int GRAPH_TIME_LABEL_H = 28;
 
 #define TEMP_MIN 22
-#define TEMP_MAX 30
+#define TEMP_MAX 35
 #define HUM_MIN 45
 #define HUM_MAX 80
 
@@ -47,6 +49,12 @@ const char LAST_TIME_FILE[] = "lasttime.txt";  // 存啟動時間
 volatile bool button_pressed = false;
 bool screen_on = true;
 
+struct GraphTick {
+  int x;
+  uint8_t hh;
+  uint8_t mm;
+};
+
 struct Record {
   DateTime time;
   float temp;
@@ -57,10 +65,20 @@ SemaphoreHandle_t sdMutex;
 SemaphoreHandle_t lcdMutex;
 
 
-#define DISPLAY_TASK_SIZE 1024
-#define TRIM_BUFFER_SIZE 1920  // 可改成 2048、8192 等視 SRAM 而定
-char trimBuffer[TRIM_BUFFER_SIZE];  // ✅ 放在全域，減少堆疊壓力
-//#define DEBUG_TRIM_LOG  // 註解掉這行即可關閉 trimOldRecords 的 log
+#define DISPLAY_TASK_SIZE 1280
+#define RECORD_TASK_SIZE 1280
+#define GRAPH_POINT_MAX 400
+#define TRIM_MARGIN 50
+const char CSV_HEADER[] = "Timestamp,Temperature_C,Humidity_%";
+const char TEMP_NAME[] = "temp.tmp";
+const char TRIM_READY[] = "trim.rdy";
+
+// 只留畫面上看得到的那段。畫線時不再握著 SD 鎖，也不用 String。
+int16_t graphTemp10[GRAPH_POINT_MAX];
+uint8_t graphHum[GRAPH_POINT_MAX];
+volatile bool graphDirty = true;
+
+static char sdBlock[128];
 
 enum TimeAdjustMode { NONE, ADJUST_MINUTE, ADJUST_HOUR };
 TimeAdjustMode adjustMode = NONE;
@@ -71,6 +89,202 @@ volatile bool isAdjustingTime = false;
 
 bool force_set_compile_time = false;
 
+
+static bool takeSd(uint16_t timeoutMs) {
+  return xSemaphoreTake(sdMutex, pdMS_TO_TICKS(timeoutMs)) == pdTRUE;
+}
+
+static void giveSd() {
+  xSemaphoreGive(sdMutex);
+}
+
+static bool takeLcd(uint16_t timeoutMs) {
+  return xSemaphoreTake(lcdMutex, pdMS_TO_TICKS(timeoutMs)) == pdTRUE;
+}
+
+static void giveLcd() {
+  xSemaphoreGive(lcdMutex);
+}
+
+static void yieldWhileSdBusy() {
+  if (xTaskGetSchedulerState() == taskSCHEDULER_RUNNING) {
+    vTaskDelay(1);
+  }
+}
+
+static int countAllLines(File& file) {
+  int lines = 0;
+  bool partial = false;
+  uint8_t blocks = 0;
+  for (;;) {
+    int n = file.read((uint8_t*)sdBlock, (uint16_t)sizeof(sdBlock));
+    if (n <= 0) break;
+    for (int i = 0; i < n; i++) {
+      partial = true;
+      if (sdBlock[i] == '\n') {
+        lines++;
+        partial = false;
+      }
+    }
+    if (++blocks == 32) {
+      blocks = 0;
+      yieldWhileSdBusy();
+    }
+  }
+  if (partial) lines++;
+  return lines;
+}
+
+static int countDataLinesUnlocked() {
+  File file = SD.open(FILENAME, FILE_READ);
+  if (!file) return 0;
+  int lines = countAllLines(file);
+  file.close();
+  if (lines <= 0) return 0;
+  return lines - 1;
+}
+
+static File* lineFile = NULL;
+static int lineLen = 0;
+static int linePos = 0;
+static char lineBuf[96];
+
+static void lineReaderStart(File* file) {
+  lineFile = file;
+  lineLen = 0;
+  linePos = 0;
+}
+
+static bool readCsvLine(char* out, size_t outSize) {
+  if (outSize == 0 || lineFile == NULL) return false;
+  size_t o = 0;
+  bool any = false;
+  for (;;) {
+    if (linePos >= lineLen) {
+      lineLen = lineFile->read((uint8_t*)lineBuf, (uint16_t)sizeof(lineBuf));
+      linePos = 0;
+      if (lineLen <= 0) {
+        if (!any) return false;
+        out[o] = '\0';
+        return true;
+      }
+    }
+    char c = lineBuf[linePos++];
+    any = true;
+    if (c == '\n') {
+      if (o > 0 && out[o - 1] == '\r') o--;
+      out[o] = '\0';
+      return true;
+    }
+    if (o + 1 < outSize) out[o++] = c;
+  }
+}
+
+// SD 程式庫同一時間只能開一個檔。兩個一起開時，第二個 open 會失敗。
+static bool offsetAfterNewlines(File& file, int newlines, uint32_t* offset) {
+  if (newlines <= 0) {
+    *offset = 0;
+    return true;
+  }
+  int seen = 0;
+  uint32_t pos = 0;
+  uint8_t blocks = 0;
+  for (;;) {
+    int n = file.read((uint8_t*)sdBlock, (uint16_t)sizeof(sdBlock));
+    if (n <= 0) return false;
+    for (int i = 0; i < n; i++) {
+      pos++;
+      if (sdBlock[i] == '\n' && ++seen == newlines) {
+        *offset = pos;
+        return true;
+      }
+    }
+    if (++blocks == 32) {
+      blocks = 0;
+      yieldWhileSdBusy();
+    }
+  }
+}
+
+static bool appendFromOffset(const char* from, uint32_t offset, const char* to) {
+  uint8_t chunks = 0;
+  for (;;) {
+    File src = SD.open(from, FILE_READ);
+    if (!src) return false;
+    uint32_t srcSize = src.size();
+    if (offset > srcSize) {
+      src.close();
+      return false;
+    }
+    if (offset == srcSize) {
+      src.close();
+      return true;
+    }
+    if (!src.seek(offset)) {
+      src.close();
+      return false;
+    }
+    int n = src.read((uint8_t*)sdBlock, (uint16_t)sizeof(sdBlock));
+    src.close();
+    if (n <= 0) return false;
+
+    File dst = SD.open(to, FILE_WRITE);
+    if (!dst) return false;
+    size_t wrote = dst.write((const uint8_t*)sdBlock, (size_t)n);
+    dst.close();
+    if (wrote != (size_t)n) return false;
+    offset += (uint32_t)n;
+    if (++chunks == 4) {
+      chunks = 0;
+      yieldWhileSdBusy();
+    }
+  }
+}
+
+static bool copyPathReplacing(const char* from, const char* to) {
+  File src = SD.open(from, FILE_READ);
+  if (!src) return false;
+  uint32_t bytes = src.size();
+  src.close();
+
+  SD.remove(to);
+  File dst = SD.open(to, FILE_WRITE);
+  if (!dst) return false;
+  dst.close();
+  if (bytes == 0) return true;
+  if (!appendFromOffset(from, 0, to)) {
+    SD.remove(to);
+    return false;
+  }
+
+  File check = SD.open(to, FILE_READ);
+  if (!check) return false;
+  uint32_t got = check.size();
+  check.close();
+  if (got != bytes) {
+    SD.remove(to);
+    return false;
+  }
+  return true;
+}
+
+// trim 寫到一半斷電時，trim.rdy 代表 temp.tmp 已是完整檔，開機用它還原。
+static void recoverHistoryFile() {
+  bool ready = SD.exists(TRIM_READY);
+  bool hasTmp = SD.exists(TEMP_NAME);
+  if (ready && hasTmp) {
+    if (copyPathReplacing(TEMP_NAME, FILENAME)) {
+      SD.remove(TEMP_NAME);
+      SD.remove(TRIM_READY);
+      Serial.println(F("[boot] 已從 temp.tmp 還原 temp.csv"));
+    } else {
+      Serial.println(F("[boot] temp.tmp 還原失敗"));
+    }
+    return;
+  }
+  if (hasTmp) SD.remove(TEMP_NAME);
+  if (ready) SD.remove(TRIM_READY);
+}
 
 void setup() {
   Serial.begin(115200);
@@ -84,11 +298,15 @@ void setup() {
 
   mylcd.Init_LCD();
   mylcd.Fill_Screen(BLACK);
-  mylcd.Set_Rotation(1);
+  // 3 = 270°。相對原本的橫向再轉 180°，產品倒放時畫面仍是正的。
+  mylcd.Set_Rotation(3);
 
   int screen_w = mylcd.Get_Display_Width();
+  int screen_h = mylcd.Get_Display_Height();
   GRAPH_W = screen_w - GRAPH_X - 20;
-  GRAPH_BOTTOM = GRAPH_Y + GRAPH_H;
+  GRAPH_BOTTOM = screen_h - GRAPH_TIME_LABEL_H;
+  if (GRAPH_BOTTOM < GRAPH_Y + 40) GRAPH_BOTTOM = GRAPH_Y + 40;
+  GRAPH_H = GRAPH_BOTTOM - GRAPH_Y;
 
   dht.begin();
   pinMode(chipSelect, OUTPUT);
@@ -100,6 +318,8 @@ void setup() {
     while (1);
   }
 
+  recoverHistoryFile();
+
   // --------------- 時間初始化 -----------------
   compareAndSetStartTime();   // 取代原本的 loadLastTime + parseCompileTime
   // --------------------------------------------
@@ -110,40 +330,25 @@ void setup() {
   ensureFullData();
 //  drawGraphFromSD();
   // 建立任務（堆疊加大）
-  xTaskCreate(TaskRecordSensor, "RecordSensor", 1024, NULL, 2, NULL);
+  xTaskCreate(TaskRecordSensor, "RecordSensor", RECORD_TASK_SIZE, NULL, 2, NULL);
   xTaskCreate(TaskUpdateDisplay, "UpdateDisplay", DISPLAY_TASK_SIZE, NULL, 1, NULL);
   // xTaskCreate(TaskSerialCommand, "SerialCmd", 1024, NULL, 1, NULL);
   xTaskCreate(TaskButtonHandler, "ButtonHandler", 1024, NULL, 1, NULL);  // 新增按鈕處理任務
 }
 
-int countDataLines() {
-  File file = SD.open(FILENAME);
-  if (!file) return 0;
-
-  // 跳過 header
-  file.readStringUntil('\n');
-
-  int lines = 0;
-  while (file.available()) {
-    if (file.readStringUntil('\n').length() > 0) lines++;
-  }
-  file.close();
-  return lines;
-}
-
 void ensureFullData() {
-  if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
+  if (!takeSd(5000)) {
     Serial.println("[ERROR] 無法取得 SD mutex，跳過補資料");
     return;
   }
 
-  int currentLines = countDataLines();  // 計算資料筆數（不含 header）
+  int currentLines = countDataLinesUnlocked();
 
   if (currentLines >= MAX_RECORDS) {
-    Serial.print("資料已足夠：");
+    Serial.print("資料已足夠:");
     Serial.print(currentLines);
     Serial.println(" 筆，無需補充");
-    xSemaphoreGive(sdMutex);
+    giveSd();
     return;
   }
 
@@ -157,13 +362,13 @@ void ensureFullData() {
   File file = SD.open(FILENAME, FILE_WRITE);
   if (!file) {
     Serial.println("無法開啟 temp.csv");
-    xSemaphoreGive(sdMutex);
+    giveSd();
     return;
   }
 
   // 確保有 header
   if (file.size() == 0) {
-    file.println("Timestamp,Temperature_C,Humidity_%");
+    file.println(CSV_HEADER);
   } else {
     // 跳過 header，定位到最後
     file.seek(file.size());
@@ -199,10 +404,9 @@ void ensureFullData() {
   }
 
   file.close();
-  xSemaphoreGive(sdMutex);
-
   Serial.print("補充完成！總筆數：");
-  Serial.println(countDataLines());
+  Serial.println(countDataLinesUnlocked());
+  giveSd();
 }
 
 /**
@@ -216,8 +420,8 @@ bool compareAndSetStartTime() {
   sprintf(compile_str, "%04d-%02d-%02d %02d:%02d:%02d",
           compile_time.year(), compile_time.month(), compile_time.day(),
           compile_time.hour(), compile_time.minute(), compile_time.second());
-  Serial.print(F("編譯時間: "));
-  Serial.println(compile_str);
+  // Serial.print(F("編譯時間: "));
+  // Serial.println(compile_str);
 
   DateTime file_time(1970, 1, 1, 0, 0, 0);
   bool file_valid = false;
@@ -240,10 +444,10 @@ bool compareAndSetStartTime() {
 
   if (!file_valid || compile_time >= file_time) {
     start_time = compile_time;
-    Serial.println(F("採用編譯時間"));
+    // Serial.println(F("採用編譯時間"));
   } else {
     start_time = file_time;
-    Serial.println(F("採用檔案時間"));
+    // Serial.println(F("採用檔案時間"));
   }
 
   if(force_set_compile_time == true)
@@ -292,25 +496,123 @@ bool loadLastTime() {
   return true;
 }
 
-void updateLastTimeToSD(DateTime time) {
+static void writeLastTimeUnlocked(DateTime time) {
   SD.remove(LAST_TIME_FILE);
   File time_file = SD.open(LAST_TIME_FILE, FILE_WRITE);
   if (time_file) {
-    char buf[20];
+    char buf[24];
     sprintf(buf, "%04d-%02d-%02d %02d:%02d:%02d", time.year(), time.month(), time.day(), time.hour(), time.minute(), time.second());
     time_file.println(buf);
     time_file.close();
-    Serial.print("[updateLastTimeToSD] 儲存時間: "); Serial.println(buf);
+  } else {
+    Serial.println(F("[time] 無法寫入 lasttime.txt"));
   }
 }
 
-DateTime getCurrentTime() {
-  unsigned long elapsed = millis() - start_millis;
-  // 處理溢位
-  if (millis() < start_millis) {
-    elapsed = (0xFFFFFFFF - start_millis) + millis();
+void updateLastTimeToSD(DateTime time) {
+  if (!takeSd(2000)) {
+    Serial.println(F("[time] SD busy"));
+    return;
   }
-  return start_time + TimeSpan(elapsed / 1000);
+  writeLastTimeUnlocked(time);
+  giveSd();
+}
+
+// log/teraterm_v5.log，2026-10-08 09:04 到 2026-10-12 09:27。
+// 兩段開機分開擬合後，振盪器偏慢，真實毫秒 = 裝置 millis * 1002308 / 1000000。
+static unsigned long correctedElapsed(unsigned long elapsed) {
+  unsigned long q = elapsed / 1000000UL;
+  unsigned long r = elapsed % 1000000UL;
+  return elapsed + q * 2308UL + (r * 2308UL) / 1000000UL;
+}
+
+DateTime getCurrentTime() {
+  // unsigned 相減在 millis 溢位後仍是經過時間。
+  unsigned long elapsed = millis() - start_millis;
+  return start_time + TimeSpan(correctedElapsed(elapsed) / 1000);
+}
+
+static const char DRIFT_LOG[] = "drift.log";
+static const uint32_t DRIFT_LOG_MAX = 2UL * 1024UL * 1024UL;
+
+static int formatTemp10(char* dst, int dstSize, float tempC) {
+  if (isnan(tempC) || dstSize < 8) return 0;
+  int t10 = (int)(tempC * 10.0f + (tempC >= 0.0f ? 0.5f : -0.5f));
+  int neg = 0;
+  if (t10 < 0) {
+    neg = 1;
+    t10 = -t10;
+  }
+  return snprintf(dst, dstSize, " %s%d.%d", neg ? "-" : "", t10 / 10, t10 % 10);
+}
+
+static bool appendDriftLine(const char* line) {
+  if (!takeSd(800)) return false;
+  File file = SD.open(DRIFT_LOG, FILE_WRITE);
+  bool ok = false;
+  if (!file) {
+    giveSd();
+    return false;
+  }
+  if (file.size() < DRIFT_LOG_MAX) {
+    ok = file.println(line) > 0;
+  }
+  file.close();
+  giveSd();
+  return ok;
+}
+
+static void logDriftSample(DateTime now, float tempC) {
+  char buf[64];
+  int n = snprintf(buf, sizeof(buf), "DRIFT %lu %04d-%02d-%02d %02d:%02d:%02d",
+                   millis(),
+                   now.year(), now.month(), now.day(),
+                   now.hour(), now.minute(), now.second());
+  if (n > 0 && n < (int)sizeof(buf)) formatTemp10(buf + n, (int)sizeof(buf) - n, tempC);
+  appendDriftLine(buf);
+}
+
+static void logTimeSync(DateTime time) {
+  char buf[48];
+  snprintf(buf, sizeof(buf), "SYNC %lu %04d-%02d-%02d %02d:%02d:%02d",
+           millis(),
+           time.year(), time.month(), time.day(),
+           time.hour(), time.minute(), time.second());
+  if (!appendDriftLine(buf)) Serial.println(F("[drift] SYNC write failed"));
+}
+
+static void printDriftLog() {
+  logDriftSample(getCurrentTime(), dht.readTemperature());
+  if (!takeSd(3000)) {
+    Serial.println(F("[drift] SD busy"));
+    return;
+  }
+  File file = SD.open(DRIFT_LOG, FILE_READ);
+  if (!file) {
+    giveSd();
+    Serial.println(F("[drift] no drift.log"));
+    return;
+  }
+  Serial.println(F("[drift] begin"));
+  while (file.available()) {
+    int n = file.read((uint8_t*)sdBlock, (uint16_t)sizeof(sdBlock));
+    if (n <= 0) break;
+    Serial.write((const uint8_t*)sdBlock, n);
+  }
+  file.close();
+  giveSd();
+  Serial.flush();
+  Serial.println(F("[drift] end"));
+}
+
+static void clearDriftLog() {
+  if (!takeSd(2000)) {
+    Serial.println(F("[drift] SD busy"));
+    return;
+  }
+  SD.remove(DRIFT_LOG);
+  giveSd();
+  Serial.println(F("[drift] cleared"));
 }
 
 void buttonISR() { button_pressed = true; }
@@ -355,7 +657,7 @@ void loop() {
     cmd.trim();
     if (cmd == "CLEAR") {
       clearCSV();
-      Serial.println("📁 temp.csv 已清空");
+      Serial.println("temp.csv 已清空");
     }
   }
 */
@@ -363,10 +665,27 @@ void loop() {
 
 void checkStack(const char* taskName) {
   UBaseType_t stackLeft = uxTaskGetStackHighWaterMark(NULL);
-  if (stackLeft < 50) {
-    Serial.print("["); Serial.print(taskName); Serial.print("] ⚠️ Stack low: ");
-    Serial.println(stackLeft);
+  if (stackLeft >= 16) return;
+
+  struct Mark {
+    const char* name;
+    UBaseType_t left;
+  };
+  static Mark marks[3];
+  for (int i = 0; i < 3; i++) {
+    if (marks[i].name == NULL) {
+      marks[i].name = taskName;
+      marks[i].left = stackLeft;
+      break;
+    }
+    if (strcmp(marks[i].name, taskName) == 0) {
+      if (stackLeft >= marks[i].left) return;
+      marks[i].left = stackLeft;
+      break;
+    }
   }
+  Serial.print("["); Serial.print(taskName); Serial.print("] Stack low: ");
+  Serial.println(stackLeft);
 }
 
 void TaskRecordSensor(void *pvParameters) {
@@ -374,11 +693,18 @@ void TaskRecordSensor(void *pvParameters) {
   TickType_t lastWakeTime = xTaskGetTickCount();
 
   static unsigned long lastLogMillis = 0;
+  static unsigned long lastDriftPrint = 0;
 
   for (;;) {
     DateTime now = getCurrentTime();
     float t = dht.readTemperature();
     float h = dht.readHumidity();
+    unsigned long ms = millis();
+
+    if (lastDriftPrint == 0 || ms - lastDriftPrint >= 60000UL) {
+      lastDriftPrint = ms;
+      logDriftSample(now, t);
+    }
 
     if (!isnan(t) && !isnan(h) && t > -40 && t < 80 && h >= 0 && h <= 100) {
       if (!isAdjustingTime) {
@@ -386,17 +712,9 @@ void TaskRecordSensor(void *pvParameters) {
       }
 
 
-      // ✅ 每 60 秒記錄一次資料
-      if (millis() - lastLogMillis >= 60000) {
-        if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
-          logToSD(t, h, now);
-          updateLastTimeToSD(now);
-          xSemaphoreGive(sdMutex);
-        } else {
-          Serial.println("[RecordSensor] SD busy, skip log");
-        }
-
-        lastLogMillis = millis();
+      // 寫入失敗就留到下一輪再試，不要把這一次計時吃掉
+      if (millis() - lastLogMillis >= 60000UL) {
+        if (logToSD(t, h, now)) lastLogMillis = millis();
       }
     } else {
       Serial.println("[RecordSensor] 感測值異常");
@@ -408,35 +726,21 @@ void TaskRecordSensor(void *pvParameters) {
 }
 
 void TaskUpdateDisplay(void *pvParameters) {
-  const TickType_t interval = 60000 / portTICK_PERIOD_MS;
-  TickType_t lastWakeTime = xTaskGetTickCount();
-  
-  for (;;) {
-    if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
-      drawGraphFromSD();  // ✅ 圖表更新可能較久，獨立執行
-      
-      // ✅ 條件觸發 trim：資料超過 MAX_RECORDS 且距離上次 trim 足夠久
-      int lines = countLines(FILENAME);
-      if (lines > MAX_RECORDS + 50) {
-        #ifdef DEBUG_TRIM_LOG
-        Serial.print(millis());
-        Serial.println("[trimOldRecords] 開始 trimOldRecords...");
-        Serial.print("[trimOldRecords] Stack left: ");
-        Serial.println(uxTaskGetStackHighWaterMark(NULL));
-        #endif
+  unsigned long lastTrimMs = millis();
 
-        trimOldRecords();
-          
-        #ifdef DEBUG_TRIM_LOG
-        Serial.print(millis());
-        Serial.println("[trimOldRecords] 完成搬移");
-        #endif
-      }
-      xSemaphoreGive(sdMutex);
+  for (;;) {
+    if (graphDirty) {
+      graphDirty = false;
+      if (!drawGraphFromSD()) graphDirty = true;
+    }
+
+    if (millis() - lastTrimMs >= 60000UL) {
+      lastTrimMs = millis();
+      trimOldRecords();
     }
 
     checkStack("UpdateDisplay");
-    vTaskDelayUntil(&lastWakeTime, interval);
+    vTaskDelay(pdMS_TO_TICKS(1000));
   }
 }
 
@@ -451,52 +755,57 @@ void TaskSerialCommand(void *pvParameters) {
 }
 
 void SerialCommand(void) {
-  String cmdBuffer = "";
+  static char cmd[80];
+  static uint8_t len = 0;
 
   while (Serial.available()) {
-      char c = Serial.read();
-      if (c == '\n') {
-        cmdBuffer.trim();
-        if (cmdBuffer == "CLEAR") {
-          if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
-            clearCSV();
-            xSemaphoreGive(sdMutex);
-            Serial.println("📁 temp.csv 已清空");
-          }else{
-            Serial.println("fail to erase");
-          }
-        } else if (cmdBuffer == "GETTIME") {
-          DateTime now = getCurrentTime();
-          char buf[25];
-          sprintf(buf, "%04d-%02d-%02d %02d:%02d:%02d",
-                  now.year(), now.month(), now.day(),
-                  now.hour(), now.minute(), now.second());
-          Serial.print("TIME "); Serial.println(buf);
-        } else if (cmdBuffer.startsWith("SETTIME")) {
-          delay(500);
-          int y, mo, d, h, mi, s;
-          if (sscanf(cmdBuffer.c_str(), "SETTIME %04d-%02d-%02d %02d:%02d:%02d",
-                     &y, &mo, &d, &h, &mi, &s) == 6) {
-            start_time = DateTime(y, mo, d, h, mi, s);
-            start_millis = millis();
-            if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
-              updateLastTimeToSD(start_time);
-              xSemaphoreGive(sdMutex);
-            } else {
-              Serial.println("SD busy, skip update");
-            }
+    char c = Serial.read();
+    if (c == '\r') continue;
+    if (c != '\n') {
+      if (len + 1 < sizeof(cmd)) cmd[len++] = c;
+      continue;
+    }
 
-            Serial.println("時間已更新！");
-          } else {
-            Serial.println("SETTIME 格式錯誤，應為 yyyy-MM-dd HH:mm:ss");
-          }
-        }
+    cmd[len] = '\0';
+    len = 0;
 
-        cmdBuffer = "";
+    char* start = cmd;
+    while (*start == ' ' || *start == '\t') start++;
+    int end = strlen(start);
+    while (end > 0 && (start[end - 1] == ' ' || start[end - 1] == '\t')) {
+      start[--end] = '\0';
+    }
+
+    if (strcmp(start, "CLEAR") == 0) {
+      if (clearCSV()) Serial.println(F("temp.csv 已清空"));
+      else Serial.println(F("fail to erase"));
+    } else if (strcmp(start, "PRINTLOG") == 0) {
+      printDriftLog();
+    } else if (strcmp(start, "CLEARLOG") == 0) {
+      clearDriftLog();
+    } else if (strcmp(start, "GETTIME") == 0) {
+      DateTime now = getCurrentTime();
+      char buf[25];
+      sprintf(buf, "%04d-%02d-%02d %02d:%02d:%02d",
+              now.year(), now.month(), now.day(),
+              now.hour(), now.minute(), now.second());
+      Serial.print(F("TIME "));
+      Serial.println(buf);
+    } else if (strncmp(start, "SETTIME", 7) == 0) {
+      delay(500);
+      int y, mo, d, h, mi, s;
+      if (sscanf(start, "SETTIME %04d-%02d-%02d %02d:%02d:%02d",
+                 &y, &mo, &d, &h, &mi, &s) == 6) {
+        start_time = DateTime(y, mo, d, h, mi, s);
+        start_millis = millis();
+        updateLastTimeToSD(start_time);
+        logTimeSync(start_time);
+        Serial.println(F("時間已更新！"));
       } else {
-        cmdBuffer += c;
+        Serial.println(F("SETTIME 格式錯誤，應為 yyyy-MM-dd HH:mm:ss"));
       }
     }
+  }
 }
 
 
@@ -536,10 +845,10 @@ void TaskButtonHandler(void *pvParameters) {
         // 短按：+1
         if (adjustMode == ADJUST_MINUTE) {
           adjustTime = adjustTime + TimeSpan(0, 0, 1, 0);
-          Serial.print("分鐘 +1 → "); Serial.println(adjustTime.minute());
+          Serial.print("分鐘 +1 "); Serial.println(adjustTime.minute());
         } else if (adjustMode == ADJUST_HOUR) {
           adjustTime = adjustTime + TimeSpan(0, 1, 0, 0);
-          Serial.print("小時 +1 → "); Serial.println(adjustTime.hour());
+          Serial.print("小時 +1 "); Serial.println(adjustTime.hour());
         }
       }
       drawTimeAdjustHint(adjustMode, adjustTime);
@@ -551,7 +860,8 @@ void TaskButtonHandler(void *pvParameters) {
                             adjustTime.hour(), adjustTime.minute(), 0);
       start_millis = millis();
       updateLastTimeToSD(start_time);
-      Serial.println("⏱ 校時完成並儲存！");
+      logTimeSync(start_time);
+      Serial.println("校時完成並儲存");
       adjustMode = NONE;
       isAdjustingTime = false;
     }
@@ -615,28 +925,46 @@ void drawTimeAdjustHint(TimeAdjustMode mode, DateTime time) {
 
 void toggleScreen() {
   if (screen_on) {
-    mylcd.Write_Cmd(0x28);
+    if (takeLcd(2000)) {
+      mylcd.Write_Cmd(0x28);
+      giveLcd();
+    }
     Serial.println("off");
   } else {
-    mylcd.Write_Cmd(0x29);
+    if (takeLcd(2000)) {
+      mylcd.Write_Cmd(0x29);
+      giveLcd();
+    }
     Serial.println("on");
     drawUI();
-    drawGraphFromSD();
+    graphDirty = false;
+    if (!drawGraphFromSD()) graphDirty = true;
   }
   screen_on = !screen_on;
 }
 
 
-void clearCSV() {
+bool clearCSV() {
+  if (!takeSd(2000)) {
+    Serial.println(F("[clear] SD busy"));
+    return false;
+  }
   SD.remove(FILENAME);
+  SD.remove(TEMP_NAME);
+  SD.remove(TRIM_READY);
   File file = SD.open(FILENAME, FILE_WRITE);
+  bool ok = false;
   if (file) {
-    file.println("Time,Temperature,Humidity");
+    ok = file.println(CSV_HEADER) > 0;
     file.close();
   }
+  giveSd();
+  graphDirty = true;
+  return ok;
 }
 
 void drawUI() {
+  if (!takeLcd(2000)) return;
   mylcd.Fill_Screen(BLACK);
   mylcd.Set_Text_Size(2);
   mylcd.Set_Text_colour(WHITE);
@@ -644,6 +972,7 @@ void drawUI() {
   mylcd.Print_String("12-Hour Temp/Hum Monitor", 10, 10);
   drawAxes();
   drawYAxisLabels();
+  giveLcd();
 }
 
 void drawAxes() {
@@ -651,11 +980,14 @@ void drawAxes() {
   mylcd.Draw_Rectangle(GRAPH_X - 1, GRAPH_Y - 1, GRAPH_X + GRAPH_W + 1, GRAPH_BOTTOM + 1);
 
   mylcd.Set_Text_Size(2);
-  for (int t = TEMP_MIN; t <= TEMP_MAX; t += 2) {
-    int y = tempToY(t);
+  for (int t = TEMP_MIN;;) {
+    int label = (TEMP_MAX - t < 2) ? TEMP_MAX : t;
+    int y = tempToY(label);
     mylcd.Set_Text_colour(YELLOW);
     mylcd.Set_Text_Back_colour(BLACK);
     mylcd.Draw_Fast_HLine(GRAPH_X - 5, y, 5);
+    if (label == TEMP_MAX) break;
+    t += 2;
   }
   for (int h = HUM_MIN; h <= HUM_MAX; h += 10) {
     int y = humToY(h);
@@ -720,139 +1052,143 @@ void updateTopLine(float t, float h, DateTime now) {
 }
 
 
-void logToSD(float t, float h, DateTime time) {
+bool logToSD(float t, float h, DateTime time) {
+  if (!takeSd(800)) {
+    Serial.println(F("[log] SD busy"));
+    return false;
+  }
+
+  bool ok = false;
   File file = SD.open(FILENAME, FILE_WRITE);
-  if (!file) return;
+  if (!file) {
+    Serial.println(F("[log] 無法開啟 temp.csv"));
+  } else {
+    if (file.size() == 0) file.println(CSV_HEADER);
+    file.seek(file.size());
 
-  if (file.size() == 0) {
-    file.println("Timestamp,Temperature_C,Humidity_%");
+    char timestamp[20];
+    sprintf(timestamp, "%04d-%02d-%02d %02d:%02d:00",
+            time.year(), time.month(), time.day(),
+            time.hour(), time.minute());
+
+    size_t wrote = file.print(timestamp);
+    wrote += file.print(',');
+    wrote += file.print(t, 1);
+    wrote += file.print(',');
+    wrote += file.println((int)h);
+    file.close();
+    if (wrote == 0) {
+      Serial.println(F("[log] 寫入失敗"));
+    } else {
+      writeLastTimeUnlocked(time);
+      ok = true;
+    }
   }
-  
-  file.seek(file.size());  // 移到檔尾
 
-  char timestamp[20];
-  sprintf(timestamp, "%04d-%02d-%02d %02d:%02d:00",
-          time.year(), time.month(), time.day(),
-          time.hour(), time.minute());
-
-  file.print(timestamp);
-  file.print(",");
-  file.print(t, 1);
-  file.print(",");
-  file.println((int)h);
-  file.close();
-}
-
-int countLines(const char* filename) {
-  File file = SD.open(filename);
-  if (!file) return 0;
-  int lines = 0;
-  while (file.available()) {
-    if (file.read() == '\n') lines++;
-  }
-  int extra = (file.position() > 0 && file.peek() != -1) ? 1 : 0;
-  file.close();
-  return lines + extra;
+  giveSd();
+  if (ok) graphDirty = true;
+  return ok;
 }
 
 void trimOldRecords() {
-  #ifdef DEBUG_TRIM_LOG
-  Serial.println("[trimOldRecords] 開始執行");
-  #endif
-
-  File src = SD.open(FILENAME, FILE_READ);
-  if (!src) {
-    #ifdef DEBUG_TRIM_LOG
-    Serial.println("[trimOldRecords] 開啟原始檔失敗");
-    #endif
+  if (!takeSd(2500)) {
+    Serial.println(F("[trim] SD busy"));
     return;
   }
 
-  int totalLines = 0;
-  while (src.available()) {
-    if (src.read() == '\n') totalLines++;
+  File file = SD.open(FILENAME, FILE_READ);
+  if (!file) {
+    giveSd();
+    return;
   }
-  src.close();
+  int totalLines = countAllLines(file);
+  file.close();
 
-  #ifdef DEBUG_TRIM_LOG
-  Serial.print("[trimOldRecords] 總行數（含 header）: ");
-  Serial.println(totalLines);
-  #endif
-
-  if (totalLines <= MAX_RECORDS + 1) {
-    #ifdef DEBUG_TRIM_LOG
-    Serial.println("[trimOldRecords] 資料尚未超過 MAX_RECORDS，無需裁剪");
-    #endif
+  int dataLines = totalLines > 0 ? totalLines - 1 : 0;
+  if (dataLines <= MAX_RECORDS + TRIM_MARGIN) {
+    giveSd();
     return;
   }
 
-  int skipLines = totalLines - MAX_RECORDS;
-  #ifdef DEBUG_TRIM_LOG
-  Serial.print("[trimOldRecords] 將跳過前 ");
-  Serial.print(skipLines);
-  Serial.println(" 行");
-  #endif
+  int toSkip = (dataLines - MAX_RECORDS) + 1;
+  Serial.print(F("[trim] 資料 "));
+  Serial.print(dataLines);
+  Serial.print(F(" 筆，保留最新 "));
+  Serial.println(MAX_RECORDS);
 
-  src = SD.open(FILENAME, FILE_READ);
-  if (!src) {
-    #ifdef DEBUG_TRIM_LOG
-    Serial.println("[trimOldRecords] 第二次開啟原始檔失敗");
-    #endif
+  file = SD.open(FILENAME, FILE_READ);
+  if (!file) {
+    Serial.println(F("[trim] 無法讀取 temp.csv"));
+    giveSd();
+    return;
+  }
+  uint32_t srcSize = file.size();
+  uint32_t keepAt = 0;
+  bool found = offsetAfterNewlines(file, toSkip, &keepAt);
+  file.close();
+  if (!found || keepAt >= srcSize) {
+    Serial.println(F("[trim] 無法定位保留起點，原檔保留"));
+    giveSd();
     return;
   }
 
-  File dst = SD.open("temp.tmp", FILE_WRITE);
+  SD.remove(TEMP_NAME);
+  SD.remove(TRIM_READY);
+
+  File dst = SD.open(TEMP_NAME, FILE_WRITE);
   if (!dst) {
-    #ifdef DEBUG_TRIM_LOG
-    Serial.println("[trimOldRecords] 無法建立 temp.tmp");
-    #endif
-    src.close();
+    Serial.println(F("[trim] 無法建立 temp.tmp"));
+    giveSd();
+    return;
+  }
+  size_t headerWrote = dst.println(CSV_HEADER);
+  uint32_t headerBytes = dst.size();
+  dst.close();
+  if (headerWrote == 0 || headerBytes == 0) {
+    SD.remove(TEMP_NAME);
+    Serial.println(F("[trim] 寫入 temp.tmp 失敗，原檔保留"));
+    giveSd();
     return;
   }
 
-  // 跳過前 skipLines 行
-  int skipped = 0;
-  while (src.available() && skipped < skipLines) {
-    if (src.read() == '\n') skipped++;
+  Serial.println(F("[trim] 寫入 temp.tmp"));
+  if (!appendFromOffset(FILENAME, keepAt, TEMP_NAME)) {
+    SD.remove(TEMP_NAME);
+    Serial.println(F("[trim] 寫入 temp.tmp 失敗，原檔保留"));
+    giveSd();
+    return;
   }
 
-  // 寫入 header
-  dst.println("Timestamp,Temperature_C,Humidity_%");
-
-  while (src.available()) {
-    size_t n = src.readBytes(trimBuffer, TRIM_BUFFER_SIZE);
-    dst.write((uint8_t*)trimBuffer, n);
+  File check = SD.open(TEMP_NAME, FILE_READ);
+  uint32_t tmpSize = check ? check.size() : 0;
+  if (check) check.close();
+  if (tmpSize != headerBytes + (srcSize - keepAt)) {
+    SD.remove(TEMP_NAME);
+    Serial.println(F("[trim] 寫入 temp.tmp 失敗，原檔保留"));
+    giveSd();
+    return;
   }
 
-  src.close(); dst.close();
+  File marker = SD.open(TRIM_READY, FILE_WRITE);
+  if (!marker) {
+    SD.remove(TEMP_NAME);
+    Serial.println(F("[trim] 無法寫入 trim.rdy，取消覆蓋"));
+    giveSd();
+    return;
+  }
+  marker.close();
 
-  #ifdef DEBUG_TRIM_LOG
-  Serial.println("[trimOldRecords] 資料搬移完成，準備覆蓋原始檔");
-  #endif
-
-  SD.remove(FILENAME);
-  File final = SD.open(FILENAME, FILE_WRITE);
-  File temp = SD.open("temp.tmp", FILE_READ);
-  if (final && temp) {
-    while (temp.available()) {
-      size_t n = temp.readBytes(trimBuffer, TRIM_BUFFER_SIZE);
-      final.write((uint8_t*)trimBuffer, n);
-    }
-
-    final.close(); temp.close();
-    SD.remove("temp.tmp");
-    #ifdef DEBUG_TRIM_LOG
-    Serial.println("[trimOldRecords] 成功覆蓋原始檔並刪除 temp.tmp");
-    #endif
-  } else {
-    #ifdef DEBUG_TRIM_LOG
-    Serial.println("[trimOldRecords] 覆蓋失敗，請檢查 SD 狀態");
-    #endif
+  Serial.println(F("[trim] 覆蓋 temp.csv"));
+  if (!copyPathReplacing(TEMP_NAME, FILENAME)) {
+    Serial.println(F("[trim] 覆蓋失敗，開機時會用 temp.tmp 還原"));
+    giveSd();
+    return;
   }
 
-  #ifdef DEBUG_TRIM_LOG
-  Serial.println("[trimOldRecords] 執行結束");
-  #endif
+  SD.remove(TEMP_NAME);
+  SD.remove(TRIM_READY);
+  Serial.println(F("[trim] 裁切完成"));
+  giveSd();
 }
 
 int tempToY(float temp) {
@@ -870,12 +1206,15 @@ int humToY(float hum) {
 void drawYAxisLabels() {
   mylcd.Set_Text_Size(2);
 
-  for (int t = TEMP_MIN; t <= TEMP_MAX; t += 2) {
-    int y = tempToY(t);
+  for (int t = TEMP_MIN;;) {
+    int label = (TEMP_MAX - t < 2) ? TEMP_MAX : t;
+    int y = tempToY(label);
     mylcd.Set_Text_colour(YELLOW);
     char buf[8];
-    sprintf(buf, "%dC", t);
+    sprintf(buf, "%dC", label);
     mylcd.Print_String(buf, 0, y - 6);
+    if (label == TEMP_MAX) break;
+    t += 2;
   }
 
   for (int h = HUM_MIN; h <= HUM_MAX; h += 10) {
@@ -887,120 +1226,168 @@ void drawYAxisLabels() {
   }
 }
 
-void drawGraphFromSD() {
-  const int MAX_POINTS = GRAPH_W;
-  const int TICK_COUNT = 4;
-  const int BYTES_PER_LINE = 40;
-  const int LINES_PER_BATCH = TRIM_BUFFER_SIZE / BYTES_PER_LINE;
+static bool parseHistoryLine(const char* line, uint8_t* hh, uint8_t* mm, int16_t* temp10, uint8_t* hum) {
+  int y, mo, d, h, mi;
+  const char* comma = strchr(line, ',');
+  if (!comma) return false;
+  if (sscanf(line, "%d-%d-%d %d:%d", &y, &mo, &d, &h, &mi) != 5) return false;
+  const char* comma2 = strchr(comma + 1, ',');
+  if (!comma2) return false;
 
-  File file = SD.open(FILENAME);
-  if (!file) {
-    Serial.println("無法開啟 temp.csv");
-    return;
+  float temp = atof(comma + 1);
+  float humidity = atof(comma2 + 1);
+  if (h < 0) h = 0;
+  if (h > 23) h = 23;
+  if (mi < 0) mi = 0;
+  if (mi > 59) mi = 59;
+  *hh = (uint8_t)h;
+  *mm = (uint8_t)mi;
+
+  float scaled = temp * 10.0f;
+  *temp10 = (int16_t)(scaled >= 0 ? scaled + 0.5f : scaled - 0.5f);
+  int hv = (int)(humidity >= 0 ? humidity + 0.5f : humidity - 0.5f);
+  if (hv < 0) hv = 0;
+  if (hv > 100) hv = 100;
+  *hum = (uint8_t)hv;
+  return true;
+}
+
+static int loadGraphPoints(GraphTick* ticks, int tickCapacity, int* tickCount) {
+  *tickCount = 0;
+  File file = SD.open(FILENAME, FILE_READ);
+  if (!file) return -1;
+
+  int totalLines = countAllLines(file);
+  file.close();
+  int dataLines = totalLines > 0 ? totalLines - 1 : 0;
+  if (dataLines <= 0) return 0;
+
+  int keep = dataLines;
+  if (GRAPH_W > 0 && keep > GRAPH_W) keep = GRAPH_W;
+  if (keep > GRAPH_POINT_MAX) keep = GRAPH_POINT_MAX;
+  int skipData = dataLines - keep;
+
+  file = SD.open(FILENAME, FILE_READ);
+  if (!file) return -1;
+  lineReaderStart(&file);
+
+  char line[64];
+  int skipped = 0;
+  int toSkip = skipData + 1;
+  while (skipped < toSkip) {
+    if (!readCsvLine(line, sizeof(line))) {
+      file.close();
+      lineFile = NULL;
+      return -1;
+    }
+    skipped++;
   }
 
-  file.readStringUntil('\n'); // 跳過 header
-
-  // 預先計算總筆數
-  int total_lines = 0;
-  while (file.available()) {
-    if (file.readStringUntil('\n').length() > 0) total_lines++;
+  int tickInterval = keep / 4;
+  if (tickInterval < 1) tickInterval = 1;
+  int count = 0;
+  while (count < keep && readCsvLine(line, sizeof(line))) {
+    if (line[0] == '\0') continue;
+    uint8_t hh, mm, hum;
+    int16_t temp10;
+    if (!parseHistoryLine(line, &hh, &mm, &temp10, &hum)) continue;
+    graphTemp10[count] = temp10;
+    graphHum[count] = hum;
+    if (ticks != NULL && *tickCount < tickCapacity && (count % tickInterval) == 0) {
+      ticks[*tickCount].x = GRAPH_X + count;
+      ticks[*tickCount].hh = hh;
+      ticks[*tickCount].mm = mm;
+      (*tickCount)++;
+    }
+    count++;
   }
   file.close();
+  lineFile = NULL;
+  if (count <= 0) return -1;
+  return count;
+}
 
-  int skip_lines = max(0, total_lines - MAX_POINTS);
+static void printText(const char* s, int x, int y, uint16_t textColor, uint16_t bgColor, uint8_t text_size) {
+  int char_w = 6 * text_size;
+  int char_h = 8 * text_size;
+  int text_w = strlen(s) * char_w;
+  mylcd.Set_Text_Size(text_size);
+  mylcd.Set_Draw_color(bgColor);
+  mylcd.Fill_Rectangle(x, y, x + text_w, y + char_h);
+  mylcd.Set_Text_colour(textColor);
+  mylcd.Set_Text_Back_colour(bgColor);
+  mylcd.Print_String(s, x, y);
+}
 
-  // 重新開啟並跳過 header + skip_lines
-  file = SD.open(FILENAME);
-  file.readStringUntil('\n'); // 跳過 header
-  for (int i = 0; i < skip_lines; i++) {
-    file.readStringUntil('\n');
+void printWithBackground(const char* s, int x, int y, uint16_t textColor, uint16_t bgColor, uint8_t text_size) {
+  if (!takeLcd(8000)) return;
+  printText(s, x, y, textColor, bgColor, text_size);
+  giveLcd();
+}
+
+static bool drawGraphPoints(int count, const GraphTick* ticks, int tickCount) {
+  if (!takeLcd(8000)) {
+    Serial.println(F("[draw] LCD busy"));
+    return false;
   }
-
 
   mylcd.Set_Draw_color(BLACK);
   mylcd.Fill_Rectangle(GRAPH_X, GRAPH_Y, GRAPH_X + GRAPH_W, GRAPH_BOTTOM);
 
   int last_x = -1, last_temp_y = -1, last_hum_y = -1;
-  int index = 0;
-  int tick_interval = MAX_POINTS / TICK_COUNT;
-  struct Tick { int x; DateTime time; } ticks[TICK_COUNT + 1];
-  int tick_index = 0;
-
-  while (file.available() && index < MAX_POINTS) {
-    for (int i = 0; i < LINES_PER_BATCH && file.available() && index < MAX_POINTS; i++) {
-      size_t len = file.readBytesUntil('\n', trimBuffer, TRIM_BUFFER_SIZE - 1);
-      if (len == 0) continue;
-      trimBuffer[len] = '\0';
-
-      char* token = strtok(trimBuffer, ",");
-      if (!token) continue;
-
-      int y, mo, d, hr, mi;
-      if (sscanf(token, "%d-%d-%d %d:%d", &y, &mo, &d, &hr, &mi) != 5) continue;
-      DateTime record_time(y, mo, d, hr, mi, 0);
-
-      token = strtok(NULL, ",");
-      if (!token) continue;
-      float t = atof(token);
-
-      token = strtok(NULL, ",");
-      if (!token) continue;
-      float h = atof(token);
-
-      int x = GRAPH_X + index;
-      int temp_y = tempToY(t);
-      int hum_y = humToY(h);
-
-      if (last_x >= 0) {
-        mylcd.Set_Draw_color(YELLOW); mylcd.Draw_Line(last_x, last_temp_y, x, temp_y);
-        mylcd.Set_Draw_color(CYAN);   mylcd.Draw_Line(last_x, last_hum_y, x, hum_y);
-      }
-
-      last_x = x; last_temp_y = temp_y; last_hum_y = hum_y;
-
-      if (tick_index <= TICK_COUNT && index % tick_interval == 0) {
-        ticks[tick_index++] = {x, record_time};
-      }
-
-      index++;
+  int n = count;
+  if (n > GRAPH_POINT_MAX) n = GRAPH_POINT_MAX;
+  for (int i = 0; i < n; i++) {
+    int x = GRAPH_X + i;
+    int temp_y = tempToY(graphTemp10[i] / 10.0f);
+    int hum_y = humToY((float)graphHum[i]);
+    if (last_x >= 0) {
+      mylcd.Set_Draw_color(YELLOW);
+      mylcd.Draw_Line(last_x, last_temp_y, x, temp_y);
+      mylcd.Set_Draw_color(CYAN);
+      mylcd.Draw_Line(last_x, last_hum_y, x, hum_y);
     }
+    last_x = x;
+    last_temp_y = temp_y;
+    last_hum_y = hum_y;
   }
-  file.close();
 
-  // 畫最後一點
   if (last_x >= 0) {
-    mylcd.Set_Draw_color(YELLOW); mylcd.Fill_Circle(last_x, last_temp_y, 2);
-    mylcd.Set_Draw_color(CYAN);   mylcd.Fill_Circle(last_x, last_hum_y, 2);
+    mylcd.Set_Draw_color(YELLOW);
+    mylcd.Fill_Circle(last_x, last_temp_y, 2);
+    mylcd.Set_Draw_color(CYAN);
+    mylcd.Fill_Circle(last_x, last_hum_y, 2);
   }
 
-  // 畫刻度
   mylcd.Set_Draw_color(BLACK);
-  mylcd.Fill_Rectangle(GRAPH_X, GRAPH_BOTTOM + 6, GRAPH_X + GRAPH_W, GRAPH_BOTTOM + 20);
-
-  for (int i = 0; i < tick_index; i++) {
+  int label_bottom = GRAPH_BOTTOM + GRAPH_TIME_LABEL_H - 2;
+  int screen_h = mylcd.Get_Display_Height();
+  if (label_bottom >= screen_h) label_bottom = screen_h - 1;
+  mylcd.Fill_Rectangle(GRAPH_X, GRAPH_BOTTOM + 6, GRAPH_X + GRAPH_W, label_bottom);
+  for (int i = 0; i < tickCount; i++) {
     mylcd.Draw_Fast_VLine(ticks[i].x, GRAPH_BOTTOM, 5);
-    char buf[6]; sprintf(buf, "%02d:%02d", ticks[i].time.hour(), ticks[i].time.minute());
-    int text_w = strlen(buf) * 6 * 2;
-    int x = ticks[i].x - text_w / 2;
-    x = constrain(x, 0, mylcd.Get_Display_Width() - text_w);
-
-    printWithBackground(buf, x, GRAPH_BOTTOM + 10, WHITE, BLACK, 2);
+    char buf[6];
+    sprintf(buf, "%02d:%02d", ticks[i].hh, ticks[i].mm);
+    int text_w = strlen(buf) * 12;
+    int tx = ticks[i].x - text_w / 2;
+    tx = constrain(tx, 0, mylcd.Get_Display_Width() - text_w);
+    printText(buf, tx, GRAPH_BOTTOM + 10, WHITE, BLACK, 2);
   }
+
+  giveLcd();
+  return true;
 }
 
-void printWithBackground(const char* s, int x, int y, uint16_t textColor, uint16_t bgColor, uint8_t text_size) {
-  if (xSemaphoreTake(lcdMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
-    int char_w = 6 * text_size; // 每個字元寬度（根據 Set_Text_Size(2)）
-    int char_h = 8 * text_size; // 每個字元高度（根據 Set_Text_Size(2)）
-    int text_w = strlen(s) * char_w;
-    mylcd.Set_Text_Size(text_size);
-    mylcd.Set_Draw_color(bgColor);
-    mylcd.Fill_Rectangle(x, y, x + text_w, y + char_h);
-
-    mylcd.Set_Text_colour(textColor);
-    mylcd.Set_Text_Back_colour(bgColor); // ✅ 加上這行，確保文字底色一致
-    mylcd.Print_String(s, x, y);
-    xSemaphoreGive(lcdMutex);
+bool drawGraphFromSD() {
+  if (!takeSd(2500)) {
+    Serial.println(F("[draw] SD busy"));
+    return false;
   }
+
+  GraphTick ticks[5];
+  int tickCount = 0;
+  int count = loadGraphPoints(ticks, 5, &tickCount);
+  giveSd();
+  if (count < 0) return false;
+  return drawGraphPoints(count, ticks, tickCount);
 }
