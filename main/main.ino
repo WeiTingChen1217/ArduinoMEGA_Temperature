@@ -106,9 +106,16 @@ static void giveLcd() {
   xSemaphoreGive(lcdMutex);
 }
 
+static void yieldWhileSdBusy() {
+  if (xTaskGetSchedulerState() == taskSCHEDULER_RUNNING) {
+    vTaskDelay(1);
+  }
+}
+
 static int countAllLines(File& file) {
   int lines = 0;
   bool partial = false;
+  uint8_t blocks = 0;
   for (;;) {
     int n = file.read((uint8_t*)sdBlock, (uint16_t)sizeof(sdBlock));
     if (n <= 0) break;
@@ -118,6 +125,10 @@ static int countAllLines(File& file) {
         lines++;
         partial = false;
       }
+    }
+    if (++blocks == 32) {
+      blocks = 0;
+      yieldWhileSdBusy();
     }
   }
   if (partial) lines++;
@@ -169,28 +180,92 @@ static bool readCsvLine(char* out, size_t outSize) {
   }
 }
 
-static bool copyFile(File& src, File& dst) {
+// SD 程式庫同一時間只能開一個檔。兩個一起開時，第二個 open 會失敗。
+static bool offsetAfterNewlines(File& file, int newlines, uint32_t* offset) {
+  if (newlines <= 0) {
+    *offset = 0;
+    return true;
+  }
+  int seen = 0;
+  uint32_t pos = 0;
+  uint8_t blocks = 0;
   for (;;) {
+    int n = file.read((uint8_t*)sdBlock, (uint16_t)sizeof(sdBlock));
+    if (n <= 0) return false;
+    for (int i = 0; i < n; i++) {
+      pos++;
+      if (sdBlock[i] == '\n' && ++seen == newlines) {
+        *offset = pos;
+        return true;
+      }
+    }
+    if (++blocks == 32) {
+      blocks = 0;
+      yieldWhileSdBusy();
+    }
+  }
+}
+
+static bool appendFromOffset(const char* from, uint32_t offset, const char* to) {
+  uint8_t chunks = 0;
+  for (;;) {
+    File src = SD.open(from, FILE_READ);
+    if (!src) return false;
+    uint32_t srcSize = src.size();
+    if (offset > srcSize) {
+      src.close();
+      return false;
+    }
+    if (offset == srcSize) {
+      src.close();
+      return true;
+    }
+    if (!src.seek(offset)) {
+      src.close();
+      return false;
+    }
     int n = src.read((uint8_t*)sdBlock, (uint16_t)sizeof(sdBlock));
-    if (n <= 0) return true;
-    if (dst.write((const uint8_t*)sdBlock, (size_t)n) != (size_t)n) return false;
+    src.close();
+    if (n <= 0) return false;
+
+    File dst = SD.open(to, FILE_WRITE);
+    if (!dst) return false;
+    size_t wrote = dst.write((const uint8_t*)sdBlock, (size_t)n);
+    dst.close();
+    if (wrote != (size_t)n) return false;
+    offset += (uint32_t)n;
+    if (++chunks == 4) {
+      chunks = 0;
+      yieldWhileSdBusy();
+    }
   }
 }
 
 static bool copyPathReplacing(const char* from, const char* to) {
   File src = SD.open(from, FILE_READ);
   if (!src) return false;
+  uint32_t bytes = src.size();
+  src.close();
+
   SD.remove(to);
   File dst = SD.open(to, FILE_WRITE);
-  if (!dst) {
-    src.close();
+  if (!dst) return false;
+  dst.close();
+  if (bytes == 0) return true;
+  if (!appendFromOffset(from, 0, to)) {
+    SD.remove(to);
     return false;
   }
-  bool ok = copyFile(src, dst);
-  src.close();
-  dst.close();
-  if (!ok) SD.remove(to);
-  return ok;
+
+  File check = SD.open(to, FILE_READ);
+  if (!check) return false;
+  uint32_t got = check.size();
+  check.close();
+  if (got != bytes) {
+    SD.remove(to);
+    return false;
+  }
+  return true;
 }
 
 // trim 寫到一半斷電時，trim.rdy 代表 temp.tmp 已是完整檔，開機用它還原。
@@ -443,13 +518,18 @@ void updateLastTimeToSD(DateTime time) {
   giveSd();
 }
 
+// log/teraterm_v5.log，2026-10-08 09:04 到 2026-10-12 09:27。
+// 兩段開機分開擬合後，振盪器偏慢，真實毫秒 = 裝置 millis * 1002308 / 1000000。
+static unsigned long correctedElapsed(unsigned long elapsed) {
+  unsigned long q = elapsed / 1000000UL;
+  unsigned long r = elapsed % 1000000UL;
+  return elapsed + q * 2308UL + (r * 2308UL) / 1000000UL;
+}
+
 DateTime getCurrentTime() {
+  // unsigned 相減在 millis 溢位後仍是經過時間。
   unsigned long elapsed = millis() - start_millis;
-  // 處理溢位
-  if (millis() < start_millis) {
-    elapsed = (0xFFFFFFFF - start_millis) + millis();
-  }
-  return start_time + TimeSpan(elapsed / 1000);
+  return start_time + TimeSpan(correctedElapsed(elapsed) / 1000);
 }
 
 static const char DRIFT_LOG[] = "drift.log";
@@ -1036,43 +1116,53 @@ void trimOldRecords() {
   Serial.print(F(" 筆，保留最新 "));
   Serial.println(MAX_RECORDS);
 
-  SD.remove(TEMP_NAME);
-  SD.remove(TRIM_READY);
-
   file = SD.open(FILENAME, FILE_READ);
-  File dst = SD.open(TEMP_NAME, FILE_WRITE);
-  if (!file || !dst) {
-    if (file) file.close();
-    if (dst) dst.close();
-    SD.remove(TEMP_NAME);
-    Serial.println(F("[trim] 無法建立 temp.tmp"));
+  if (!file) {
+    Serial.println(F("[trim] 無法讀取 temp.csv"));
+    giveSd();
+    return;
+  }
+  uint32_t srcSize = file.size();
+  uint32_t keepAt = 0;
+  bool found = offsetAfterNewlines(file, toSkip, &keepAt);
+  file.close();
+  if (!found || keepAt >= srcSize) {
+    Serial.println(F("[trim] 無法定位保留起點，原檔保留"));
     giveSd();
     return;
   }
 
-  dst.println(CSV_HEADER);
-  lineReaderStart(&file);
+  SD.remove(TEMP_NAME);
+  SD.remove(TRIM_READY);
 
-  char line[64];
-  int skipped = 0;
-  bool writeOk = true;
-  while (skipped < toSkip) {
-    if (!readCsvLine(line, sizeof(line))) {
-      writeOk = false;
-      break;
-    }
-    skipped++;
+  File dst = SD.open(TEMP_NAME, FILE_WRITE);
+  if (!dst) {
+    Serial.println(F("[trim] 無法建立 temp.tmp"));
+    giveSd();
+    return;
   }
-  while (writeOk && readCsvLine(line, sizeof(line))) {
-    if (line[0] == '\0') continue;
-    if (dst.println(line) == 0) writeOk = false;
-  }
-
-  file.close();
+  size_t headerWrote = dst.println(CSV_HEADER);
+  uint32_t headerBytes = dst.size();
   dst.close();
-  lineFile = NULL;
+  if (headerWrote == 0 || headerBytes == 0) {
+    SD.remove(TEMP_NAME);
+    Serial.println(F("[trim] 寫入 temp.tmp 失敗，原檔保留"));
+    giveSd();
+    return;
+  }
 
-  if (!writeOk) {
+  Serial.println(F("[trim] 寫入 temp.tmp"));
+  if (!appendFromOffset(FILENAME, keepAt, TEMP_NAME)) {
+    SD.remove(TEMP_NAME);
+    Serial.println(F("[trim] 寫入 temp.tmp 失敗，原檔保留"));
+    giveSd();
+    return;
+  }
+
+  File check = SD.open(TEMP_NAME, FILE_READ);
+  uint32_t tmpSize = check ? check.size() : 0;
+  if (check) check.close();
+  if (tmpSize != headerBytes + (srcSize - keepAt)) {
     SD.remove(TEMP_NAME);
     Serial.println(F("[trim] 寫入 temp.tmp 失敗，原檔保留"));
     giveSd();
@@ -1088,14 +1178,8 @@ void trimOldRecords() {
   }
   marker.close();
 
-  SD.remove(FILENAME);
-  File src = SD.open(TEMP_NAME, FILE_READ);
-  File out = SD.open(FILENAME, FILE_WRITE);
-  bool copied = src && out && copyFile(src, out);
-  if (src) src.close();
-  if (out) out.close();
-  if (!copied) {
-    SD.remove(FILENAME);
+  Serial.println(F("[trim] 覆蓋 temp.csv"));
+  if (!copyPathReplacing(TEMP_NAME, FILENAME)) {
     Serial.println(F("[trim] 覆蓋失敗，開機時會用 temp.tmp 還原"));
     giveSd();
     return;

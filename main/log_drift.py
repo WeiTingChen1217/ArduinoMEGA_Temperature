@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
-"""Analyze a Tera Term capture of PRINTLOG.
+"""Analyze a Tera Term capture and report the clock correction.
 
-The board stores one line per minute on the SD card. PRINTLOG prints that
-file. Turn on Tera Term's local timestamp so the dump looks like:
+PRINTLOG dumps drift.log. With local timestamps it looks like:
 
     2026-10-06 09:00:01.123 SYNC 1000 2026-10-01 09:00:00
     2026-10-06 09:00:01.200 DRIFT 432000000 2026-10-06 09:00:01 25.1
 
-SYNC is written when SETTIME matches the PC clock. The script treats that
-device time as the real start, and the newest PC timestamp in the file as
-the real end.
+A long capture of the live display is also accepted. Those lines look like:
+
+    [2026-10-08 09:04:36.984] [TopLine] 09:04 10/08 | 27C | 62%
+
+Boot lines containing 最終採用時間 start a new powered segment, so time
+spent off is not treated as drift.
 """
 
 import re
@@ -139,20 +141,131 @@ def analyze_live(rows):
     report_ratio(device_seconds, true_seconds, len(best))
 
 
+TOP_LINE = re.compile(
+    r"\[(?P<pc>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)?)\]\s*"
+    r"\[TopLine\]\s+(?P<hh>\d{2}):(?P<mm>\d{2})\s+(?P<mo>\d{2})/(?P<dd>\d{2})"
+)
+BOOT_LINE = re.compile(
+    r"\[(?P<pc>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)?)\]\s*"
+    r"最終採用時間:\s*(?P<dev>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})"
+)
+
+
+def read_text(path):
+    raw = open(path, "rb").read()
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw.decode("cp950", errors="replace")
+
+
+def fit_scale(pairs):
+    count = len(pairs)
+    sum_x = sum_y = sum_xx = sum_xy = 0.0
+    for device_s, pc_s in pairs:
+        sum_x += device_s
+        sum_y += pc_s
+        sum_xx += device_s * device_s
+        sum_xy += device_s * pc_s
+    denom = count * sum_xx - sum_x * sum_x
+    if denom == 0:
+        return None
+    return (count * sum_xy - sum_x * sum_y) / denom
+
+
+def analyze_topline(text):
+    marks = []
+    for raw in text.splitlines():
+        boot = BOOT_LINE.search(raw)
+        if boot:
+            marks.append(("boot", parse_pc(boot.group("pc")), parse_pc(boot.group("dev"))))
+            continue
+        top = TOP_LINE.search(raw)
+        if not top:
+            continue
+        pc = parse_pc(top.group("pc"))
+        device = datetime(
+            pc.year, int(top.group("mo")), int(top.group("dd")),
+            int(top.group("hh")), int(top.group("mm")),
+        )
+        marks.append(("top", pc, device))
+
+    segments = []
+    current = []
+    for kind, pc, device in marks:
+        if kind == "boot":
+            if current:
+                segments.append(current)
+            current = []
+            continue
+        if current:
+            prev_pc, prev_dev = current[-1]
+            device_delta = (device - prev_dev).total_seconds()
+            pc_delta = (pc - prev_pc).total_seconds()
+            if device_delta < 0 or pc_delta > device_delta + 180:
+                segments.append(current)
+                current = []
+        if not current or device != current[-1][1]:
+            current.append((pc, device))
+    if current:
+        segments.append(current)
+
+    weighted_scale = 0.0
+    weighted_span = 0.0
+    used = 0
+    edge_count = 0
+    for edges in segments:
+        if len(edges) < 30:
+            continue
+        origin_pc, origin_dev = edges[0]
+        pairs = [
+            ((device - origin_dev).total_seconds(), (pc - origin_pc).total_seconds())
+            for pc, device in edges
+        ]
+        span = pairs[-1][0]
+        if span < 3600:
+            continue
+        scale = fit_scale(pairs)
+        if scale is None or scale <= 0:
+            continue
+        weighted_scale += scale * span
+        weighted_span += span
+        used += 1
+        edge_count += len(edges)
+        print(f"開機段 {edges[0][1]} -> {edges[-1][1]}，倍率 {scale:.8f}")
+
+    if weighted_span <= 0:
+        print("TopLine 的連續紀錄不足，無法計算")
+        return 1
+
+    scale = weighted_scale / weighted_span
+    per_million = int(round((scale - 1.0) * 1_000_000.0))
+    device_seconds = weighted_span
+    true_seconds = weighted_span * scale
+    print(f"採用 {used} 段開機，裝置經過 {device_seconds:.0f} 秒")
+    report_ratio(device_seconds, true_seconds, edge_count)
+    print(f"韌體每 1000000 ms 加上 {per_million} ms")
+    return 0
+
+
 def main():
     if len(sys.argv) != 2:
         print(f"用法: python3 {sys.argv[0]} teraterm.log")
         return 1
-    rows, pc_times = load(sys.argv[1])
-    if not rows:
-        print("沒有讀到 DRIFT 或 SYNC")
-        return 1
-    span = (max(pc_times) - min(pc_times)).total_seconds() if len(pc_times) >= 2 else 0
-    if span > 6 * 3600:
-        analyze_live(rows)
-    else:
-        analyze_dump(rows, pc_times)
-    return 0
+    text = read_text(sys.argv[1])
+    if "DRIFT" in text or "SYNC" in text:
+        rows, pc_times = load(sys.argv[1])
+        if rows:
+            span = (max(pc_times) - min(pc_times)).total_seconds() if len(pc_times) >= 2 else 0
+            if span > 6 * 3600:
+                analyze_live(rows)
+            else:
+                analyze_dump(rows, pc_times)
+            return 0
+    if "[TopLine]" in text:
+        return analyze_topline(text)
+    print("沒有讀到 DRIFT、SYNC 或 TopLine")
+    return 1
 
 
 if __name__ == "__main__":
